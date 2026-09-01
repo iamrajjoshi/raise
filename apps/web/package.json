@@ -10,8 +10,10 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@fontsource-variable/ibm-plex-sans": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-serif": "^5.3.0",
     "@raise/protocol": "workspace:*",
-    "lucide-react": "^1.38.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

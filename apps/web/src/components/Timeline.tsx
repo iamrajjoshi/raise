@@ -1,4 +1,3 @@
-import { Check, Copy, ExternalLink, Image as ImageIcon, RotateCcw } from "lucide-react";
 import type { EntryView, Role } from "@raise/protocol";
 
 const entryLabel: Record<EntryView["kind"], string> = {
@@ -23,15 +22,6 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
     <ol className="timeline" aria-label="Request activity">
       {entries.map((entry) => (
         <li className={`entry entry-${entry.kind}`} key={entry.id}>
-          <div className="entry-rail" aria-hidden="true">
-            <span className="entry-dot">
-              {entry.decision === "accept" ? (
-                <Check size={12} />
-              ) : entry.decision === "request_changes" ? (
-                <RotateCcw size={12} />
-              ) : null}
-            </span>
-          </div>
           <article className="entry-card">
             <header className="entry-header">
               <div>
@@ -49,27 +39,37 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
             {entry.body && <p className="entry-body">{entry.body}</p>}
             {entry.url && (
               <div className="url-item">
-                <ExternalLink size={16} aria-hidden="true" />
                 <div>
                   <span>Linked page</span>
                   <code>{entry.url}</code>
                 </div>
                 <button
                   type="button"
+                  className="control control-quiet url-copy"
                   aria-label="Copy page URL"
                   onClick={() => navigator.clipboard.writeText(entry.url as string)}
                 >
-                  <Copy size={15} />
+                  <span className="control-glyph" aria-hidden="true">
+                    ⧉
+                  </span>
+                  Copy
                 </button>
-                <a href={entry.url} target="_blank" rel="noopener noreferrer">
+                <a
+                  className="control control-secondary url-open"
+                  href={entry.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
                   Open page
+                  <span className="control-glyph" aria-hidden="true">
+                    ↗
+                  </span>
                 </a>
               </div>
             )}
             {entry.attachments.length > 0 && (
               <div className="evidence-section">
                 <div className="evidence-heading">
-                  <ImageIcon size={15} />
                   {entry.attachments.length}{" "}
                   {entry.attachments.length === 1 ? "screenshot" : "screenshots"}
                 </div>
@@ -91,7 +91,15 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
             )}
             {entry.decision && (
               <div className={`decision decision-${entry.decision}`}>
-                {entry.decision === "accept" ? "Result accepted" : "Changes requested"}
+                {entry.decision === "accept" ? (
+                  <>
+                    <span aria-hidden="true">✓</span> Result accepted
+                  </>
+                ) : (
+                  <>
+                    <span aria-hidden="true">↺</span> Changes requested
+                  </>
+                )}
               </div>
             )}
           </article>

@@ -1,7 +1,6 @@
-import { ArrowUp, Check, CornerDownLeft, RotateCcw } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import type { AttachmentInput, PostEntryInput, RaiseView } from "@raise/protocol";
-import { ImagePicker } from "./ImagePicker";
+import { Scratchpad } from "./Scratchpad";
 
 interface ActionPanelProps {
   raise: RaiseView;
@@ -12,13 +11,11 @@ interface ActionPanelProps {
 
 export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) {
   const [body, setBody] = useState("");
-  const [url, setUrl] = useState("");
   const [images, setImages] = useState<AttachmentInput[]>([]);
   const [requestingChanges, setRequestingChanges] = useState(false);
 
   const reset = () => {
     setBody("");
-    setUrl("");
     setImages([]);
   };
 
@@ -28,7 +25,6 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
     const sent = await onSubmit({
       kind,
       body,
-      ...(url ? { url } : {}),
       attachments: images,
       expectedVersion: raise.version,
     });
@@ -39,11 +35,11 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
     return (
       <section className="resolved-panel">
         <span className="resolved-check">
-          <Check size={18} />
+          <span aria-hidden="true">✓</span>
         </span>
         <div>
           <strong>Request closed</strong>
-          <p>You can read this thread until it is deleted.</p>
+          <p>This thread stays readable until its link expires.</p>
         </div>
       </section>
     );
@@ -53,8 +49,8 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
     return (
       <section className="review-panel" aria-labelledby="review-heading">
         <div className="review-heading">
-          <h2 id="review-heading">Review the result</h2>
-          <p>Accept it or ask for changes.</p>
+          <h2 id="review-heading">Review result</h2>
+          <p>Use it as-is, or send it back with a note.</p>
         </div>
         {requestingChanges ? (
           <form
@@ -79,20 +75,27 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
               id="change-note"
               value={body}
               onChange={(event) => setBody(event.target.value)}
-              placeholder="Describe what is missing or incorrect"
+              placeholder="Say what’s still off."
               autoFocus
               required
             />
             <div className="button-row">
               <button
                 type="button"
-                className="quiet-button"
+                className="control control-quiet"
                 onClick={() => setRequestingChanges(false)}
               >
                 Cancel
               </button>
-              <button type="submit" className="primary-button" disabled={busy || !body.trim()}>
-                <CornerDownLeft size={16} /> Ask for changes
+              <button
+                type="submit"
+                className="control control-primary"
+                disabled={busy || !body.trim()}
+              >
+                Ask for changes
+                <span className="control-glyph" aria-hidden="true">
+                  ↵
+                </span>
               </button>
             </div>
           </form>
@@ -100,7 +103,7 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
           <div className="review-actions">
             <button
               type="button"
-              className="primary-button"
+              className="control control-primary"
               disabled={busy}
               onClick={() =>
                 onSubmit({
@@ -112,14 +115,20 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
                 })
               }
             >
-              <Check size={17} /> Accept result
+              <span className="control-glyph" aria-hidden="true">
+                ✓
+              </span>
+              Accept result
             </button>
             <button
               type="button"
-              className="secondary-button"
+              className="control control-secondary"
               onClick={() => setRequestingChanges(true)}
             >
-              <RotateCcw size={16} /> Ask for changes
+              <span className="control-glyph" aria-hidden="true">
+                ↺
+              </span>
+              Ask for changes
             </button>
           </div>
         )}
@@ -135,58 +144,33 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
   if (raise.permissions.canReply || raise.permissions.canPostResult) {
     const isResult = raise.permissions.canPostResult;
     return (
-      <form className="composer" onSubmit={submitContent}>
+      <section className="composer">
         <div className="composer-heading">
           <h2>{isResult ? "Result" : "Reply"}</h2>
           <p>
             {isResult
-              ? "Summarize what changed and how you checked it."
-              : "Add the detail the agent requested."}
+              ? "Add what changed, what you checked, and any screenshots."
+              : "Answer the question or paste in the missing context."}
           </p>
         </div>
-        <label className="sr-only" htmlFor="entry-body">
-          {isResult ? "Result summary" : "Reply"}
-        </label>
-        <textarea
-          id="entry-body"
+        <Scratchpad
           value={body}
-          onChange={(event) => setBody(event.target.value)}
+          onChange={setBody}
+          images={images}
+          onImagesChange={setImages}
+          onSubmit={submitContent}
+          label={isResult ? "Result summary" : "Reply"}
           placeholder={
-            isResult
-              ? "Fixed the clipping and checked the page at 375 px and 768 px."
-              : "The issue only happens below 390 px."
+            isResult ? "What changed? Paste notes, links, or screenshots." : "Paste whatever helps."
           }
+          submitLabel={isResult ? "Send for review" : "Send"}
+          busy={busy}
+          canSubmit={Boolean(body.trim() || images.length)}
+          error={error}
+          compact
           autoFocus
         />
-        <label className="inline-field">
-          <span>
-            {isResult ? "Preview or pull request" : "Page URL"} <small>(optional)</small>
-          </span>
-          <input
-            type="url"
-            value={url}
-            onChange={(event) => setUrl(event.target.value)}
-            placeholder="http://localhost:3000/settings"
-          />
-        </label>
-        <ImagePicker images={images} onChange={setImages} compact />
-        {error && (
-          <p className="form-error" role="alert">
-            {error}
-          </p>
-        )}
-        <div className="composer-footer">
-          <span>Up to 4 screenshots</span>
-          <button
-            type="submit"
-            className="primary-button"
-            disabled={busy || (!body.trim() && !url && !images.length)}
-          >
-            {busy ? "Sending…" : isResult ? "Send for review" : "Send reply"}
-            {!busy && <ArrowUp size={16} />}
-          </button>
-        </div>
-      </form>
+      </section>
     );
   }
 
@@ -197,7 +181,7 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
         <strong>
           {raise.waitingOn === "agent" ? "Waiting for the agent" : "Waiting for the reviewer"}
         </strong>
-        <p>Replies appear here automatically.</p>
+        <p>Replies show up here when they arrive.</p>
       </div>
     </section>
   );

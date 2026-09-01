@@ -183,8 +183,16 @@ export class RaiseDatabase {
     const targetRole: Role = input.origin === "human" ? "agent" : "human";
     const actionKind: PendingActionKind =
       input.origin === "human" ? "perform_work" : "provide_context";
+    const promptTitle = input.prompt
+      .split("\n")
+      .map((line) => line.trim())
+      .find((line) => line && !/^\[Imported from: .+\]$/.test(line));
     const title =
-      input.title ?? input.prompt.split("\n", 1)[0]?.slice(0, 180) ?? "Untitled request";
+      input.title ??
+      promptTitle?.slice(0, 180) ??
+      input.url?.slice(0, 180) ??
+      input.attachments[0]?.name ??
+      "Untitled thread";
 
     const ownerClaim = this.newCapability(raiseId, ownerRole, "claim", expiresAt, createdAt);
     const targetClaim = this.newCapability(raiseId, targetRole, "claim", expiresAt, createdAt);
@@ -419,31 +427,10 @@ export class RaiseDatabase {
   }
 
   postEntry(raiseId: string, sessionToken: string, input: PostEntryInput): { entryId: string } {
-    const viewer = this.authenticate(sessionToken, raiseId);
     const now = new Date().toISOString();
 
     return this.db.transaction(() => {
-      const raise = this.db.prepare("SELECT * FROM raises WHERE id = ?").get(raiseId) as
-        RaiseRecord | undefined;
-      if (!raise) {
-        throw new HttpError(404, "not_found", "This request does not exist.");
-      }
-      if (raise.lifecycle !== "open") {
-        throw new HttpError(409, "raise_closed", "This request is closed.");
-      }
-      if (raise.version !== input.expectedVersion) {
-        throw new HttpError(409, "state_conflict", "This request changed. Reload and try again.");
-      }
-
-      const pending = this.db
-        .prepare(
-          "SELECT id, target_role, kind FROM action_requests WHERE raise_id = ? AND state = 'pending'",
-        )
-        .get(raiseId) as ActionRecord | undefined;
-
-      if (input.kind !== "comment") {
-        this.assertTransition(viewer.role, pending, input);
-      }
+      const { viewerRole, pending } = this.validatePostEntry(raiseId, sessionToken, input);
 
       const entryId = id("e");
       this.db
@@ -455,7 +442,7 @@ export class RaiseDatabase {
         .run(
           entryId,
           raiseId,
-          viewer.role,
+          viewerRole,
           input.kind,
           input.body,
           input.url ?? null,
@@ -475,6 +462,36 @@ export class RaiseDatabase {
         .run(now, raiseId);
       return { entryId };
     })();
+  }
+
+  assertCanPostEntry(raiseId: string, sessionToken: string, input: PostEntryInput) {
+    this.validatePostEntry(raiseId, sessionToken, input);
+  }
+
+  private validatePostEntry(raiseId: string, sessionToken: string, input: PostEntryInput) {
+    const viewer = this.authenticate(sessionToken, raiseId);
+    const raise = this.db.prepare("SELECT * FROM raises WHERE id = ?").get(raiseId) as
+      RaiseRecord | undefined;
+    if (!raise) {
+      throw new HttpError(404, "not_found", "This request does not exist.");
+    }
+    if (raise.lifecycle !== "open") {
+      throw new HttpError(409, "raise_closed", "This request is closed.");
+    }
+    if (raise.version !== input.expectedVersion) {
+      throw new HttpError(409, "state_conflict", "This request changed. Reload and try again.");
+    }
+
+    const pending = this.db
+      .prepare(
+        "SELECT id, target_role, kind FROM action_requests WHERE raise_id = ? AND state = 'pending'",
+      )
+      .get(raiseId) as ActionRecord | undefined;
+
+    if (input.kind !== "comment") {
+      this.assertTransition(viewer.role, pending, input);
+    }
+    return { viewerRole: viewer.role, pending };
   }
 
   private assertTransition(role: Role, pending: ActionRecord | undefined, input: PostEntryInput) {

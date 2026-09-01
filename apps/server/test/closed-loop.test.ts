@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import Database from "better-sqlite3";
 import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ClaimResponse, CreateRaiseResponse, RaiseView } from "@raise/protocol";
@@ -17,11 +18,13 @@ function claimToken(url: string) {
 describe("Raise closed loop", () => {
   let app: FastifyInstance;
   let dataDir: string;
+  let databasePath: string;
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "raise-test-"));
+    databasePath = join(dataDir, "raise.db");
     app = await createApp({
-      databasePath: join(dataDir, "raise.db"),
+      databasePath,
       dataDir,
       publicBaseUrl: "http://raise.test",
     });
@@ -38,11 +41,11 @@ describe("Raise closed loop", () => {
       url: "/api/raises",
       payload: {
         origin,
-        title: requestTitle,
-        prompt:
+        prompt: `${requestTitle}\n\n${
           origin === "human"
             ? "Fix the clipped billing empty state."
-            : "Which empty state is wrong?",
+            : "Which empty state is wrong?"
+        }`,
         url: "http://localhost:3000/billing",
         attachments: withImage
           ? [{ name: "billing.png", mimeType: "image/png", dataUrl: onePixelPng }]
@@ -222,5 +225,156 @@ describe("Raise closed loop", () => {
 
     const storedFiles = await readFile(join(dataDir, "blobs", `${attachment?.id}.webp`));
     expect(storedFiles.subarray(0, 4).toString("ascii")).toBe("RIFF");
+  });
+
+  it("creates a screenshot-only request with a useful title", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/raises",
+      payload: {
+        origin: "human",
+        prompt: "",
+        attachments: [{ name: "billing.png", mimeType: "image/png", dataUrl: onePixelPng }],
+        expiresInHours: 24,
+      },
+    });
+    expect(response.statusCode).toBe(201);
+    const created = response.json<CreateRaiseResponse>();
+    const humanToken = await exchange(created.ownerClaimUrl);
+    const view = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}`,
+      headers: auth(humanToken),
+    });
+
+    expect(view.json<RaiseView>()).toMatchObject({
+      title: "billing.png",
+      entries: [{ body: "", attachments: [{ name: "billing.png" }] }],
+    });
+  });
+
+  it("accepts more than four small screenshots in a request and result", async () => {
+    const attachments = Array.from({ length: 5 }, (_, index) => ({
+      name: `screen-${index + 1}.png`,
+      mimeType: "image/png",
+      dataUrl: onePixelPng,
+    }));
+    const createdResponse = await app.inject({
+      method: "POST",
+      url: "/api/raises",
+      payload: {
+        origin: "human",
+        prompt: "Compare all five breakpoints.",
+        attachments,
+      },
+    });
+    expect(createdResponse.statusCode).toBe(201);
+    const created = createdResponse.json<CreateRaiseResponse>();
+    const agentToken = await exchange(created.targetClaimUrl);
+
+    const initial = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}`,
+      headers: auth(agentToken),
+    });
+    expect(initial.json<RaiseView>().entries[0]?.attachments).toHaveLength(5);
+
+    const result = await app.inject({
+      method: "POST",
+      url: `/api/raises/${created.raiseId}/entries`,
+      headers: auth(agentToken),
+      payload: {
+        kind: "result",
+        body: "Checked every breakpoint.",
+        attachments,
+        expectedVersion: 1,
+      },
+    });
+    expect(result.statusCode).toBe(201);
+    expect(result.json<RaiseView>().entries[1]?.attachments).toHaveLength(5);
+  });
+
+  it("returns 413 when the JSON body exceeds the transport limit", async () => {
+    await app.close();
+    app = await createApp({
+      databasePath,
+      dataDir,
+      publicBaseUrl: "http://raise.test",
+      bodyLimit: 256,
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/raises",
+      payload: {
+        origin: "human",
+        prompt: "x".repeat(300),
+      },
+    });
+
+    expect(response.statusCode).toBe(413);
+    expect(response.json()).toMatchObject({ code: "payload_too_large" });
+  });
+
+  it("does not create an empty scratchpad", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/raises",
+      payload: { origin: "human", prompt: "", attachments: [] },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ code: "invalid_request" });
+  });
+
+  it("rejects bad images before creating or advancing a request", async () => {
+    const badImage = {
+      name: "broken.png",
+      mimeType: "image/png",
+      dataUrl: "data:image/png;base64,bm90IGFuIGltYWdl",
+    };
+    const rejectedCreate = await app.inject({
+      method: "POST",
+      url: "/api/raises",
+      payload: {
+        origin: "human",
+        prompt: "This should not be saved.",
+        attachments: [badImage],
+      },
+    });
+    expect(rejectedCreate.statusCode).toBe(400);
+
+    const inspection = new Database(databasePath, { readonly: true });
+    const count = inspection.prepare("SELECT COUNT(*) AS count FROM raises").get() as {
+      count: number;
+    };
+    inspection.close();
+    expect(count.count).toBe(0);
+
+    const created = await create("human");
+    const agentToken = await exchange(created.targetClaimUrl);
+    const rejectedResult = await app.inject({
+      method: "POST",
+      url: `/api/raises/${created.raiseId}/entries`,
+      headers: auth(agentToken),
+      payload: {
+        kind: "result",
+        body: "This should not be saved either.",
+        attachments: [badImage],
+        expectedVersion: 1,
+      },
+    });
+    expect(rejectedResult.statusCode).toBe(400);
+
+    const unchanged = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}`,
+      headers: auth(agentToken),
+    });
+    expect(unchanged.json<RaiseView>()).toMatchObject({
+      version: 1,
+      waitingOn: "agent",
+    });
+    expect(unchanged.json<RaiseView>().entries).toHaveLength(1);
   });
 });

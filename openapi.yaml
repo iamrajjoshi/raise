@@ -293,7 +293,7 @@ components:
           schema:
             $ref: "#/components/schemas/ApiError"
     PayloadTooLarge:
-      description: A decoded image exceeds the server limit.
+      description: One image, the combined screenshots, or the HTTP request exceeds its byte limit.
       content:
         application/json:
           schema:
@@ -341,7 +341,18 @@ components:
 
     CreateRequestInput:
       type: object
-      required: [origin, prompt]
+      required: [origin]
+      description: Include at least one non-empty prompt, URL, or attachment.
+      anyOf:
+        - required: [prompt]
+          properties:
+            prompt:
+              minLength: 1
+        - required: [url]
+        - required: [attachments]
+          properties:
+            attachments:
+              minItems: 1
       properties:
         origin:
           $ref: "#/components/schemas/Role"
@@ -352,15 +363,16 @@ components:
           description: Optional for API clients. The server uses the first line of `prompt` when omitted.
         prompt:
           type: string
-          minLength: 1
           maxLength: 20000
+          default: ""
         url:
           type: string
           format: uri
           maxLength: 2048
         attachments:
           type: array
-          maxItems: 4
+          maxItems: 32
+          description: Screenshots may total up to 15 MiB after base64 decoding. The item ceiling is an internal abuse guard, not a recommended batch size.
           default: []
           items:
             $ref: "#/components/schemas/AttachmentInput"
@@ -432,7 +444,8 @@ components:
           $ref: "#/components/schemas/Decision"
         attachments:
           type: array
-          maxItems: 4
+          maxItems: 32
+          description: Screenshots may total up to 15 MiB after base64 decoding. The item ceiling is an internal abuse guard, not a recommended batch size.
           default: []
           items:
             $ref: "#/components/schemas/AttachmentInput"

@@ -196,7 +196,7 @@ Each release has two gates:
 - An agent opens a prompt and receives a one-time responder claim URL.
 - A human opens it and submits text plus one pasted image.
 - The active agent receives the response.
-- A human can create the same object at `/new`, retain the reviewer session, and paste a separate agent-scoped URL into an agent session.
+- A human can create the same object from one scratchpad at `/new`, retain the reviewer session, and paste a separate agent-scoped URL into an agent session.
 
 ### Build
 
@@ -829,7 +829,7 @@ Days 1–4 are M0. Days 5–14 begin v0.1; they do not complete it.
 
 ### Days 8–10: human-to-agent and result path
 
-- Add `/new`, agent share URL, `raise_read`, result entry, review request, accept, request changes, and post-resolution reopen.
+- Add the `/new` scratchpad, agent share URL, `raise_read`, result entry, review request, accept, request changes, and post-resolution reopen.
 - Confirm both creation directions use the same commands and records.
 - Add bounded wait, SSE reconnect, idempotency, and explicit `waiting_on` UI.
 

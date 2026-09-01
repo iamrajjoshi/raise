@@ -3,18 +3,24 @@ import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import cookie from "@fastify/cookie";
 import fastifyStatic from "@fastify/static";
-import { claimSchema, createRaiseSchema, postEntrySchema, type ApiError } from "@raise/protocol";
+import {
+  attachmentBudgetMessage,
+  claimSchema,
+  createRaiseSchema,
+  postEntrySchema,
+  type ApiError,
+} from "@raise/protocol";
 import Fastify, { type FastifyRequest } from "fastify";
-import { ZodError } from "zod";
 import { RaiseDatabase } from "./database.js";
 import { HttpError } from "./errors.js";
-import { storeImages } from "./images.js";
+import { prepareImages, storeImages } from "./images.js";
 
 export interface AppOptions {
   databasePath: string;
   dataDir: string;
   publicBaseUrl: string;
   logger?: boolean;
+  bodyLimit?: number;
 }
 
 function bearerToken(request: FastifyRequest, raiseId: string): string | undefined {
@@ -23,9 +29,34 @@ function bearerToken(request: FastifyRequest, raiseId: string): string | undefin
   return request.cookies[`raise_session_${raiseId}`];
 }
 
+function zodIssues(error: unknown): unknown[] | null {
+  if (!(error instanceof Error) || error.name !== "ZodError" || !("issues" in error)) return null;
+  const issues = error.issues;
+  return Array.isArray(issues) ? issues : null;
+}
+
+function hasIssueMessage(issues: unknown[] | null, message: string): boolean {
+  return Boolean(
+    issues?.some(
+      (issue) =>
+        typeof issue === "object" &&
+        issue !== null &&
+        "message" in issue &&
+        issue.message === message,
+    ),
+  );
+}
+
+function isBodyTooLarge(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "FST_ERR_CTP_BODY_TOO_LARGE";
+}
+
 export async function createApp(options: AppOptions) {
   await mkdir(options.dataDir, { recursive: true });
-  const app = Fastify({ logger: options.logger ?? false, bodyLimit: 24_000_000 });
+  const app = Fastify({
+    logger: options.logger ?? false,
+    bodyLimit: options.bodyLimit ?? 24_000_000,
+  });
   const db = new RaiseDatabase(options.databasePath);
   await app.register(cookie);
 
@@ -41,18 +72,58 @@ export async function createApp(options: AppOptions) {
       );
   });
 
+  app.setErrorHandler((error, _request, reply) => {
+    const validationIssues = zodIssues(error);
+    const imagesTooLarge = hasIssueMessage(validationIssues, attachmentBudgetMessage);
+    const bodyTooLarge = isBodyTooLarge(error);
+    const payload: ApiError = imagesTooLarge
+      ? {
+          code: "images_too_large",
+          message: attachmentBudgetMessage,
+        }
+      : bodyTooLarge
+        ? {
+            code: "payload_too_large",
+            message: "That submission is too large. Use smaller screenshots or remove one.",
+          }
+        : validationIssues
+          ? {
+              code: "invalid_request",
+              message: "Check the request and try again.",
+              details: validationIssues,
+            }
+          : error instanceof HttpError
+            ? {
+                code: error.code,
+                message: error.message,
+                ...(error.details ? { details: error.details } : {}),
+              }
+            : { code: "internal_error", message: "Something went wrong. Try again." };
+    const statusCode =
+      imagesTooLarge || bodyTooLarge
+        ? 413
+        : validationIssues
+          ? 400
+          : error instanceof HttpError
+            ? error.statusCode
+            : 500;
+    if (statusCode === 500) app.log.error(error);
+    return reply.code(statusCode).send(payload);
+  });
+
   app.get("/healthz", async () => ({ status: "ok" }));
   app.get("/readyz", async () => ({ status: "ready" }));
 
   app.post("/api/raises", async (request, reply) => {
     const input = createRaiseSchema.parse(request.body);
+    const images = await prepareImages(input.attachments);
     const created = db.createRaise(input, options.publicBaseUrl);
     await storeImages({
       db,
       dataDir: options.dataDir,
       raiseId: created.raiseId,
       entryId: created.entryId,
-      images: input.attachments,
+      images,
     });
     const { entryId: _entryId, ...response } = created;
     return reply.code(201).send(response);
@@ -87,13 +158,15 @@ export async function createApp(options: AppOptions) {
       const token = bearerToken(request, request.params.raiseId);
       if (!token) throw new HttpError(401, "unauthorized", "Open an access link for this request.");
       const input = postEntrySchema.parse(request.body);
+      db.assertCanPostEntry(request.params.raiseId, token, input);
+      const images = await prepareImages(input.attachments);
       const result = db.postEntry(request.params.raiseId, token, input);
       await storeImages({
         db,
         dataDir: options.dataDir,
         raiseId: request.params.raiseId,
         entryId: result.entryId,
-        images: input.attachments,
+        images,
       });
       return reply.code(201).send(db.getRaise(request.params.raiseId, token));
     },
@@ -136,27 +209,6 @@ export async function createApp(options: AppOptions) {
       return reply.sendFile("index.html");
     });
   }
-
-  app.setErrorHandler((error, _request, reply) => {
-    const payload: ApiError =
-      error instanceof ZodError
-        ? {
-            code: "invalid_request",
-            message: "Check the request and try again.",
-            details: error.issues,
-          }
-        : error instanceof HttpError
-          ? {
-              code: error.code,
-              message: error.message,
-              ...(error.details ? { details: error.details } : {}),
-            }
-          : { code: "internal_error", message: "Something went wrong. Try again." };
-    const statusCode =
-      error instanceof ZodError ? 400 : error instanceof HttpError ? error.statusCode : 500;
-    if (statusCode === 500) app.log.error(error);
-    return reply.code(statusCode).send(payload);
-  });
 
   app.addHook("onClose", async () => db.close());
   return app;

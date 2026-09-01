@@ -18,6 +18,21 @@ export type EntryKind = z.infer<typeof entryKindSchema>;
 export const decisionSchema = z.enum(["accept", "request_changes"]);
 export type Decision = z.infer<typeof decisionSchema>;
 
+export const maxAttachmentsPerEntry = 32;
+export const maxAttachmentBytesPerEntry = 15 * 1_024 * 1_024;
+export const attachmentBudgetMessage =
+  "Those screenshots add up to more than 15 MB. Use smaller copies or remove one.";
+
+export function dataUrlByteLength(dataUrl: string): number {
+  const commaIndex = dataUrl.indexOf(",");
+  if (commaIndex === -1) return 0;
+
+  const encoded = dataUrl.slice(commaIndex + 1).replace(/\s/g, "");
+  if (!encoded) return 0;
+  const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((encoded.length * 3) / 4) - padding);
+}
+
 export const attachmentInputSchema = z.object({
   name: z.string().trim().min(1).max(180),
   mimeType: z.enum(["image/png", "image/jpeg", "image/webp"]),
@@ -25,14 +40,40 @@ export const attachmentInputSchema = z.object({
 });
 export type AttachmentInput = z.infer<typeof attachmentInputSchema>;
 
-export const createRaiseSchema = z.object({
-  origin: roleSchema,
-  title: z.string().trim().min(1).max(180).optional(),
-  prompt: z.string().trim().min(1).max(20_000),
-  url: z.url().max(2_048).optional(),
-  attachments: z.array(attachmentInputSchema).max(4).default([]),
-  expiresInHours: z.number().int().min(1).max(168).default(24),
-});
+export const attachmentsInputSchema = z
+  .array(attachmentInputSchema)
+  .max(maxAttachmentsPerEntry)
+  .superRefine((attachments, context) => {
+    const totalBytes = attachments.reduce(
+      (total, attachment) => total + dataUrlByteLength(attachment.dataUrl),
+      0,
+    );
+    if (totalBytes > maxAttachmentBytesPerEntry) {
+      context.addIssue({
+        code: "custom",
+        message: attachmentBudgetMessage,
+      });
+    }
+  });
+
+export const createRaiseSchema = z
+  .object({
+    origin: roleSchema,
+    title: z.string().trim().min(1).max(180).optional(),
+    prompt: z.string().trim().max(20_000).default(""),
+    url: z.url().max(2_048).optional(),
+    attachments: attachmentsInputSchema.default([]),
+    expiresInHours: z.number().int().min(1).max(168).default(24),
+  })
+  .superRefine((value, context) => {
+    if (!value.prompt && !value.url && !value.attachments.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["prompt"],
+        message: "Add text, a URL, or an image.",
+      });
+    }
+  });
 export type CreateRaiseInput = z.infer<typeof createRaiseSchema>;
 
 export const claimSchema = z.object({
@@ -47,7 +88,7 @@ export const postEntrySchema = z
     body: z.string().trim().max(20_000).default(""),
     url: z.url().max(2_048).optional(),
     decision: decisionSchema.optional(),
-    attachments: z.array(attachmentInputSchema).max(4).default([]),
+    attachments: attachmentsInputSchema.default([]),
     expectedVersion: z.number().int().min(1),
   })
   .superRefine((value, context) => {

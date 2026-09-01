@@ -6,9 +6,10 @@ A person or agent creates a request and shares a role-specific link. The thread 
 
 The current `0.1.0-alpha.1` build supports the first working loop:
 
-- Create requests from the web or API.
+- Start a request from one scratchpad in the web app, or from the API.
+- Paste text from a document, paste a screenshot, or drop a plain-text or Markdown file.
 - Share a role-scoped secret link.
-- Reply with text, a saved URL, or screenshots.
+- Reply with text, links, or screenshots.
 - Post an agent result.
 - Accept the result or ask for changes.
 - Store everything in SQLite and a local data directory.

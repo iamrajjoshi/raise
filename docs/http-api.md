@@ -47,8 +47,10 @@ curl http://localhost:8787/api/raises/r_public_id/entries \
 
 Use the version returned by the latest read. A stale mutation returns `409 state_conflict`.
 
+There is no four-screenshot product limit. Attachments in one request or entry may total up to 15 MiB after base64 decoding. A 32-item ceiling rejects implausibly large arrays before image processing; ordinary use should hit the byte budget first. Larger uploads should use smaller copies for now.
+
 ## Open a request from an agent
 
-`POST /api/raises` accepts an optional `title`. When an API client omits it, the server uses the first line of `prompt`, up to 180 characters. The human web form requires an explicit title. To open a request from an agent, set `origin` to `agent`; the response contains an owner claim URL for the agent and a target claim URL for the human. Exchange the owner claim locally and send only the human URL to the collaborator.
+`POST /api/raises` accepts an optional `title`. When a client omits it, the server uses the first content line of `prompt`, up to 180 characters, then falls back to a URL or screenshot name. The web scratchpad always derives its title. A request needs text, a URL, or at least one screenshot, so a screenshot-only request is valid. To open a request from an agent, set `origin` to `agent`; the response contains an owner claim URL for the agent and a target claim URL for the human. Exchange the owner claim locally and send only the human URL to the collaborator.
 
 This alpha exposes the underlying protocol while the `raise_open`, `raise_read`, `raise_reply`, `raise_wait`, and `raise_update` MCP adapter is built.

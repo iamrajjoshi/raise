@@ -65,7 +65,7 @@ export async function imageFiles(files: File[]): Promise<AttachmentInput[]> {
     ["image/png", "image/jpeg", "image/webp"].includes(file.type),
   );
   return Promise.all(
-    accepted.slice(0, 4).map(
+    accepted.map(
       (file) =>
         new Promise<AttachmentInput>((resolve, reject) => {
           const reader = new FileReader();

@@ -1,9 +1,8 @@
-import { Link2, LockKeyhole } from "lucide-react";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import type { AttachmentInput, PostEntryInput, RaiseView } from "@raise/protocol";
 import { ActionPanel } from "./components/ActionPanel";
 import { Brand } from "./components/Brand";
-import { ImagePicker } from "./components/ImagePicker";
+import { Scratchpad } from "./components/Scratchpad";
 import { ShareCard } from "./components/ShareCard";
 import { Timeline } from "./components/Timeline";
 import {
@@ -25,25 +24,54 @@ function formatDateTime(value: string) {
   }).format(new Date(value));
 }
 
-function SiteHeader({ showNewRequest = false }: { showNewRequest?: boolean }) {
+function SiteHeader({
+  showNewRequest = false,
+  currentLabel,
+}: {
+  showNewRequest?: boolean;
+  currentLabel?: string;
+}) {
   return (
     <header className="site-header">
-      <div className="header-inner">
+      <div className="header-brand-cell">
         <Brand />
-        {showNewRequest && (
-          <a className="header-link" href="/">
+      </div>
+      <div className="header-title-cell">
+        {currentLabel ? (
+          <h1 className="header-context">{currentLabel}</h1>
+        ) : showNewRequest ? (
+          <a className="control control-quiet header-link" href="/">
             New request
           </a>
-        )}
+        ) : null}
       </div>
     </header>
   );
 }
 
+function AppFrame({
+  children,
+  currentLabel,
+  showNewRequest = false,
+  className = "",
+}: {
+  children: ReactNode;
+  currentLabel?: string;
+  showNewRequest?: boolean;
+  className?: string;
+}) {
+  return (
+    <div className={`app-shell ${className}`}>
+      <div className="work-sheet">
+        <SiteHeader showNewRequest={showNewRequest} {...(currentLabel ? { currentLabel } : {})} />
+        {children}
+      </div>
+    </div>
+  );
+}
+
 function NewRaisePage() {
-  const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [url, setUrl] = useState("");
   const [images, setImages] = useState<AttachmentInput[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -55,9 +83,7 @@ function NewRaisePage() {
     try {
       const result = await createRaise({
         origin: "human",
-        title,
         prompt,
-        ...(url ? { url } : {}),
         attachments: images,
         expiresInHours: 24,
       });
@@ -76,79 +102,26 @@ function NewRaisePage() {
   };
 
   return (
-    <div className="app-shell">
-      <SiteHeader />
-      <main className="page new-page">
-        <section className="page-heading">
-          <h1>New request</h1>
-          <p>Describe the problem and attach anything the agent should see.</p>
-        </section>
-
-        <form className="request-form" onSubmit={submit}>
-          <div className="field-group">
-            <label htmlFor="title">Title</label>
-            <input
-              className="text-input"
-              id="title"
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="Billing empty state is clipped on mobile"
-              maxLength={180}
-              autoFocus
-              required
-            />
-          </div>
-          <div className="field-group field-primary">
-            <label htmlFor="prompt">Details</label>
-            <textarea
-              id="prompt"
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder="The empty state overflows at 375 px. Fix the layout and check the mobile breakpoints."
-              required
-            />
-          </div>
-
-          <div className="field-group">
-            <label htmlFor="page-url">
-              Affected page <small>(optional)</small>
-            </label>
-            <div className="input-with-icon">
-              <Link2 size={17} aria-hidden="true" />
-              <input
-                id="page-url"
-                type="url"
-                value={url}
-                onChange={(event) => setUrl(event.target.value)}
-                placeholder="http://localhost:3000/billing/settings"
-              />
-            </div>
-            <p className="field-help">We store the URL but do not open it.</p>
-          </div>
-
-          <ImagePicker images={images} onChange={setImages} />
-
-          {error && (
-            <p className="form-error" role="alert">
-              {error}
-            </p>
-          )}
-
-          <footer className="new-footer">
-            <p className="form-note">
-              <LockKeyhole size={14} /> Access by link. Deleted after 24 hours.
-            </p>
-            <button
-              className="primary-button create-button"
-              type="submit"
-              disabled={busy || !title.trim() || !prompt.trim()}
-            >
-              {busy ? "Creating…" : "Create request"}
-            </button>
-          </footer>
-        </form>
+    <AppFrame className="app-shell-new" currentLabel="New request">
+      <main className="new-page">
+        <Scratchpad
+          value={prompt}
+          onChange={setPrompt}
+          images={images}
+          onImagesChange={setImages}
+          onSubmit={submit}
+          label="Request"
+          placeholder="Paste notes, links, screenshots, or the whole messy thread."
+          submitLabel="Send"
+          busyLabel="Sending…"
+          busy={busy}
+          canSubmit={Boolean(prompt.trim() || images.length)}
+          error={error}
+          autoFocus
+          note={<>Anyone with the link can open it. Deleted in 24 hours.</>}
+        />
       </main>
-    </div>
+    </AppFrame>
   );
 }
 
@@ -220,30 +193,28 @@ function RaisePage({ raiseId }: { raiseId: string }) {
 
   if (loading) {
     return (
-      <div className="app-shell">
-        <SiteHeader />
+      <AppFrame className="app-shell-record" showNewRequest>
         <main className="loading-state">
           <div>
             <span className="spinner" aria-hidden="true" />
             <p>Opening request…</p>
           </div>
         </main>
-      </div>
+      </AppFrame>
     );
   }
 
   if (fatal || !raise) {
     return (
-      <div className="app-shell">
-        <SiteHeader />
+      <AppFrame className="app-shell-record" showNewRequest>
         <main className="error-state">
           <h1>Link unavailable</h1>
           <p>{fatal ?? "This link is invalid, expired, or already used."}</p>
-          <a className="secondary-button" href="/">
+          <a className="control control-primary" href="/">
             Create request
           </a>
         </main>
-      </div>
+      </AppFrame>
     );
   }
 
@@ -270,8 +241,7 @@ function RaisePage({ raiseId }: { raiseId: string }) {
     : null;
 
   return (
-    <div className="app-shell">
-      <SiteHeader showNewRequest />
+    <AppFrame className="app-shell-record" showNewRequest>
       <main className="page record-page">
         <section className="record-heading">
           <div className="record-heading-topline">
@@ -281,6 +251,24 @@ function RaisePage({ raiseId }: { raiseId: string }) {
             <code>{raise.id}</code>
           </div>
           <h1>{raise.title}</h1>
+          <dl className="record-meta">
+            <div>
+              <dt>Next</dt>
+              <dd>{actionLabel ?? "Nothing"}</dd>
+            </div>
+            <div>
+              <dt>Open as</dt>
+              <dd>{raise.viewerRole === "human" ? "Reviewer" : "Agent"}</dd>
+            </div>
+            <div>
+              <dt>Created</dt>
+              <dd>{formatDateTime(raise.createdAt)}</dd>
+            </div>
+            <div>
+              <dt>Expires</dt>
+              <dd>{formatDateTime(raise.expiresAt)}</dd>
+            </div>
+          </dl>
         </section>
 
         <div className="raise-layout">
@@ -292,50 +280,22 @@ function RaisePage({ raiseId }: { raiseId: string }) {
             <Timeline entries={raise.entries} viewerRole={raise.viewerRole} />
             <ActionPanel raise={raise} busy={busy} error={error} onSubmit={submit} />
           </div>
-
-          <aside className="details-panel" aria-label="Request details">
-            <h2>Details</h2>
-            <dl>
-              <div>
-                <dt>Status</dt>
-                <dd>{statusText}</dd>
-              </div>
-              <div>
-                <dt>Next step</dt>
-                <dd>{actionLabel ?? "None"}</dd>
-              </div>
-              <div>
-                <dt>Access</dt>
-                <dd>Viewing as {raise.viewerRole === "human" ? "reviewer" : "agent"}</dd>
-              </div>
-              <div>
-                <dt>Created</dt>
-                <dd>{formatDateTime(raise.createdAt)}</dd>
-              </div>
-              <div>
-                <dt>Expires</dt>
-                <dd>{formatDateTime(raise.expiresAt)}</dd>
-              </div>
-            </dl>
-            <p className="access-note">
-              <LockKeyhole size={13} /> Each access link grants one role on this request.
-            </p>
-          </aside>
         </div>
       </main>
-    </div>
+    </AppFrame>
   );
 }
 
 function NotFoundPage() {
   return (
-    <div className="app-shell">
-      <SiteHeader />
+    <AppFrame className="app-shell-record" showNewRequest>
       <main className="error-state">
         <h1>Page not found</h1>
-        <a href="/">Create request</a>
+        <a className="control control-primary" href="/">
+          Create request
+        </a>
       </main>
-    </div>
+    </AppFrame>
   );
 }
 
