@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS build
+FROM node:26-bookworm-slim AS build
 
 ENV PNPM_HOME=/pnpm
 ENV PATH=$PNPM_HOME:$PATH
@@ -12,7 +12,7 @@ RUN pnpm install --frozen-lockfile
 RUN pnpm --filter @raise/protocol build && pnpm --filter @raise/web build && pnpm --filter @raise/server build
 RUN CI=true pnpm --config.inject-workspace-packages=true --filter @raise/server deploy --prod /prod/server
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 ENV PORT=8787
