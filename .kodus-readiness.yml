@@ -1,0 +1,10 @@
+pillars:
+  style-linting: true
+  testing: true
+  documentation: true
+  dev-environment: true
+  ci-cd: true
+  code-health: true
+  security: true
+
+aiEnabled: false

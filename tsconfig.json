@@ -1,0 +1,11 @@
+{
+  "files": [],
+  "compilerOptions": {
+    "strict": true
+  },
+  "references": [
+    { "path": "./packages/protocol" },
+    { "path": "./apps/server" },
+    { "path": "./apps/web" }
+  ]
+}

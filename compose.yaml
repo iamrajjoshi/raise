@@ -1,0 +1,16 @@
+services:
+  raise:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8787}
+      DATA_DIR: /data
+      ANONYMOUS_TTL_HOURS: ${ANONYMOUS_TTL_HOURS:-24}
+      MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-15728640}
+    volumes:
+      - raise-data:/data
+    restart: unless-stopped
+
+volumes:
+  raise-data:

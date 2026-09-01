@@ -1,0 +1,597 @@
+openapi: 3.1.0
+info:
+  title: Raise HTTP API
+  version: 0.1.0-alpha.1
+  description: A shared request and review API for people and coding agents.
+servers:
+  - url: http://localhost:8787
+    description: Local server
+tags:
+  - name: Health
+  - name: Requests
+  - name: Claims
+  - name: Attachments
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      summary: Check process health
+      tags: [Health]
+      responses:
+        "200":
+          description: The server process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ok
+
+  /readyz:
+    get:
+      operationId: getReadiness
+      summary: Check server readiness
+      tags: [Health]
+      responses:
+        "200":
+          description: The server is ready to accept requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: ready
+
+  /api/raises:
+    post:
+      operationId: createRequest
+      summary: Create a request
+      description: Creates the first prompt and returns separate one-time claim URLs for the owner and target participant.
+      tags: [Requests]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRequestInput"
+      responses:
+        "201":
+          description: The request and its claim URLs were created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateRequestResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/claims:
+    post:
+      operationId: exchangeClaim
+      summary: Exchange a one-time claim
+      description: Consumes a claim token and creates a request-scoped session. Cookie mode sets an HttpOnly cookie; token mode returns the session token in the response body.
+      tags: [Claims]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimInput"
+      responses:
+        "200":
+          description: The claim was exchanged for a session.
+          headers:
+            Set-Cookie:
+              description: Present in cookie mode. The cookie name is `raise_session_<raiseId>`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClaimResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/raises/{raiseId}:
+    parameters:
+      - $ref: "#/components/parameters/RaiseId"
+    get:
+      operationId: getRequest
+      summary: Read a request
+      description: Returns the request as seen by the current participant, including permissions and the pending action.
+      tags: [Requests]
+      security:
+        - BearerSession: []
+        - BrowserSessionCookie: []
+      responses:
+        "200":
+          description: The current request view.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/raises/{raiseId}/entries:
+    parameters:
+      - $ref: "#/components/parameters/RaiseId"
+    post:
+      operationId: postRequestEntry
+      summary: Add an entry to a request
+      description: Adds a response, result, comment, or review decision. Comments do not advance the pending action; other entry kinds must answer it.
+      tags: [Requests]
+      security:
+        - BearerSession: []
+        - BrowserSessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostEntryInput"
+      responses:
+        "201":
+          description: The entry was stored; the response contains the updated request view.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestView"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/raises/{raiseId}/attachments/{attachmentId}:
+    parameters:
+      - $ref: "#/components/parameters/RaiseId"
+      - $ref: "#/components/parameters/AttachmentId"
+    get:
+      operationId: getRequestAttachment
+      summary: Download a request screenshot
+      tags: [Attachments]
+      security:
+        - BearerSession: []
+        - BrowserSessionCookie: []
+      responses:
+        "200":
+          description: The normalized WebP image.
+          content:
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/raises/{raiseId}/changes:
+    parameters:
+      - $ref: "#/components/parameters/RaiseId"
+    get:
+      operationId: getRequestChanges
+      summary: Read a request after a version
+      description: Returns the current request when its version is greater than `after`; otherwise returns no content. This endpoint does not wait for a change.
+      tags: [Requests]
+      security:
+        - BearerSession: []
+        - BrowserSessionCookie: []
+      parameters:
+        - name: after
+          in: query
+          required: false
+          description: Last request version observed by the caller.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        "200":
+          description: The request has a newer version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestView"
+        "204":
+          description: The request does not have a newer version.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    BearerSession:
+      type: http
+      scheme: bearer
+      bearerFormat: Raise session token
+      description: "Session token returned when a claim uses `mode: token`."
+    BrowserSessionCookie:
+      type: apiKey
+      in: header
+      name: Cookie
+      description: Browser cookie written as `raise_session_<raiseId>=<sessionToken>`. OpenAPI cannot express its request-specific cookie name.
+
+  parameters:
+    RaiseId:
+      name: raiseId
+      in: path
+      required: true
+      description: Public request identifier.
+      schema:
+        type: string
+    AttachmentId:
+      name: attachmentId
+      in: path
+      required: true
+      description: Screenshot identifier returned in an entry attachment.
+      schema:
+        type: string
+
+  responses:
+    BadRequest:
+      description: The JSON body, entry content, or image is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    Unauthorized:
+      description: The claim or request session is missing, invalid, expired, or scoped to another request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    Forbidden:
+      description: The other participant must act first.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    NotFound:
+      description: The request or screenshot does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    Conflict:
+      description: The request is closed, its version changed, or the entry does not answer the pending action.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    PayloadTooLarge:
+      description: A decoded image exceeds the server limit.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+    InternalError:
+      description: The server could not complete the request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ApiError"
+
+  schemas:
+    Role:
+      type: string
+      enum: [human, agent]
+
+    Lifecycle:
+      type: string
+      enum: [open, resolved, cancelled, expired]
+
+    PendingAction:
+      type: string
+      enum: [provide_context, perform_work, review_result, make_changes]
+
+    Decision:
+      type: string
+      enum: [accept, request_changes]
+
+    AttachmentInput:
+      type: object
+      required: [name, mimeType, dataUrl]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 180
+        mimeType:
+          type: string
+          enum: [image/png, image/jpeg, image/webp]
+        dataUrl:
+          type: string
+          maxLength: 22000000
+          pattern: "^data:image/(png|jpeg|webp);base64,"
+          description: Base64 data URL whose media type matches `mimeType`.
+
+    CreateRequestInput:
+      type: object
+      required: [origin, prompt]
+      properties:
+        origin:
+          $ref: "#/components/schemas/Role"
+        title:
+          type: string
+          minLength: 1
+          maxLength: 180
+          description: Optional for API clients. The server uses the first line of `prompt` when omitted.
+        prompt:
+          type: string
+          minLength: 1
+          maxLength: 20000
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        attachments:
+          type: array
+          maxItems: 4
+          default: []
+          items:
+            $ref: "#/components/schemas/AttachmentInput"
+        expiresInHours:
+          type: integer
+          minimum: 1
+          maximum: 168
+          default: 24
+
+    CreateRequestResponse:
+      type: object
+      required: [raiseId, ownerClaimUrl, targetClaimUrl, targetRole]
+      properties:
+        raiseId:
+          type: string
+        ownerClaimUrl:
+          type: string
+          format: uri
+          description: One-time claim URL for the participant who created the request.
+        targetClaimUrl:
+          type: string
+          format: uri
+          description: One-time claim URL to send to the other participant.
+        targetRole:
+          $ref: "#/components/schemas/Role"
+
+    ClaimInput:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          minLength: 20
+          maxLength: 400
+          description: Claim token taken from the `token` fragment of a claim URL.
+        mode:
+          type: string
+          enum: [cookie, token]
+          default: cookie
+
+    ClaimResponse:
+      type: object
+      required: [raiseId, role]
+      properties:
+        raiseId:
+          type: string
+        role:
+          $ref: "#/components/schemas/Role"
+        token:
+          type: string
+          description: "Session bearer token; returned only when the claim uses `mode: token`."
+
+    PostEntryInput:
+      type: object
+      required: [kind, expectedVersion]
+      properties:
+        kind:
+          type: string
+          enum: [response, result, comment, review_decision]
+        body:
+          type: string
+          maxLength: 20000
+          default: ""
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        decision:
+          $ref: "#/components/schemas/Decision"
+        attachments:
+          type: array
+          maxItems: 4
+          default: []
+          items:
+            $ref: "#/components/schemas/AttachmentInput"
+        expectedVersion:
+          type: integer
+          minimum: 1
+      allOf:
+        - if:
+            properties:
+              kind:
+                const: review_decision
+            required: [kind]
+          then:
+            required: [decision]
+        - if:
+            properties:
+              decision:
+                const: request_changes
+            required: [decision]
+          then:
+            required: [body]
+            properties:
+              body:
+                minLength: 1
+        - if:
+            properties:
+              kind:
+                enum: [response, result, comment]
+            required: [kind]
+          then:
+            anyOf:
+              - required: [body]
+                properties:
+                  body:
+                    minLength: 1
+              - required: [url]
+              - required: [attachments]
+                properties:
+                  attachments:
+                    minItems: 1
+
+    AttachmentView:
+      type: object
+      required: [id, name, mediaType, url, width, height]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        mediaType:
+          type: string
+          const: image/webp
+        url:
+          type: string
+          format: uri-reference
+        width:
+          type: integer
+        height:
+          type: integer
+
+    EntryView:
+      type: object
+      required: [id, authorRole, kind, body, createdAt, attachments]
+      properties:
+        id:
+          type: string
+        authorRole:
+          $ref: "#/components/schemas/Role"
+        kind:
+          type: string
+          enum: [prompt, response, result, comment, review_decision]
+        body:
+          type: string
+        url:
+          type: string
+          format: uri
+        decision:
+          $ref: "#/components/schemas/Decision"
+        createdAt:
+          type: string
+          format: date-time
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttachmentView"
+
+    Permissions:
+      type: object
+      required: [canReply, canPostResult, canReview, canComment]
+      properties:
+        canReply:
+          type: boolean
+        canPostResult:
+          type: boolean
+        canReview:
+          type: boolean
+        canComment:
+          type: boolean
+
+    RequestView:
+      type: object
+      required:
+        - id
+        - title
+        - origin
+        - viewerRole
+        - lifecycle
+        - waitingOn
+        - pendingAction
+        - version
+        - createdAt
+        - updatedAt
+        - expiresAt
+        - permissions
+        - entries
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        origin:
+          $ref: "#/components/schemas/Role"
+        viewerRole:
+          $ref: "#/components/schemas/Role"
+        lifecycle:
+          $ref: "#/components/schemas/Lifecycle"
+        waitingOn:
+          oneOf:
+            - $ref: "#/components/schemas/Role"
+            - type: "null"
+        pendingAction:
+          oneOf:
+            - $ref: "#/components/schemas/PendingAction"
+            - type: "null"
+        version:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        permissions:
+          $ref: "#/components/schemas/Permissions"
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/EntryView"
+
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details: {}
