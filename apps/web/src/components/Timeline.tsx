@@ -1,4 +1,5 @@
 import type { EntryView, Role } from "@raise/protocol";
+import { Screenshot } from "./Screenshot";
 
 const entryLabel: Record<EntryView["kind"], string> = {
   prompt: "Request",
@@ -30,7 +31,7 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
                   {entry.authorRole === viewerRole
                     ? "You"
                     : entry.authorRole === "human"
-                      ? "Reviewer"
+                      ? "Human"
                       : "Agent"}
                 </span>
               </div>
@@ -40,7 +41,7 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
             {entry.url && (
               <div className="url-item">
                 <div>
-                  <span>Linked page</span>
+                  <span>Page</span>
                   <code>{entry.url}</code>
                 </div>
                 <button
@@ -75,16 +76,13 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
                 </div>
                 <div className="evidence-grid">
                   {entry.attachments.map((attachment) => (
-                    <a
-                      className="evidence-image"
-                      href={attachment.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <Screenshot
+                      src={attachment.url}
+                      name={attachment.name}
+                      width={attachment.width}
+                      height={attachment.height}
                       key={attachment.id}
-                    >
-                      <img src={attachment.url} alt={attachment.name} />
-                      <span>{attachment.name}</span>
-                    </a>
+                    />
                   ))}
                 </div>
               </div>

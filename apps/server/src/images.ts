@@ -15,6 +15,13 @@ export interface PreparedImage {
   height: number;
 }
 
+export function renderAgentPreview(storageKey: string) {
+  return sharp(storageKey)
+    .resize({ width: 1_600, height: 1_600, fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 80 })
+    .toBuffer();
+}
+
 export async function prepareImages(images: AttachmentInput[]): Promise<PreparedImage[]> {
   const prepared: PreparedImage[] = [];
   let totalSourceBytes = 0;
@@ -24,7 +31,7 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
       image.dataUrl,
     );
     if (!match || match[1] !== image.mimeType) {
-      throw new HttpError(400, "invalid_image", `${image.name} must be a PNG, JPEG, or WebP file.`);
+      throw new HttpError(400, "invalid_image", `${image.name} isn’t a PNG, JPEG, or WebP image.`);
     }
     const source = Buffer.from(match[2] as string, "base64");
     if (!source.length || source.length > MAX_IMAGE_BYTES) {
@@ -32,7 +39,7 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
       throw new HttpError(
         413,
         "image_too_large",
-        `${image.name} is larger than ${maxMegabytes} MB. Choose a smaller file.`,
+        `${image.name} is over ${maxMegabytes} MB. Try a smaller copy.`,
       );
     }
     totalSourceBytes += source.length;
@@ -41,7 +48,7 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
       throw new HttpError(
         413,
         "images_too_large",
-        `Those screenshots add up to more than ${maxMegabytes} MB. Use smaller copies or remove one.`,
+        `Those screenshots are over the ${maxMegabytes} MB limit together. Try smaller copies or remove one.`,
       );
     }
 
@@ -60,7 +67,7 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
       throw new HttpError(
         400,
         "invalid_image",
-        `We couldn't read ${image.name}. Try a different PNG, JPEG, or WebP file.`,
+        `${image.name} doesn’t look like a valid PNG, JPEG, or WebP image.`,
       );
     }
   }

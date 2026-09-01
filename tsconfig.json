@@ -6,6 +6,7 @@
   "references": [
     { "path": "./packages/protocol" },
     { "path": "./apps/server" },
-    { "path": "./apps/web" }
+    { "path": "./apps/web" },
+    { "path": "./apps/mcp" }
   ]
 }

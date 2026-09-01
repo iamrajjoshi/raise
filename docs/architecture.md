@@ -1,23 +1,22 @@
 # Architecture
 
-Raise v0.1 is one deployable service with three internal parts:
+Raise is one deployable web service with a separate local adapter for agents:
 
 ```text
-browser or coding agent
-          |
-          v
-  HTTP capability protocol
-          |
-     Fastify server
-       /       \
-  SQLite     local images
+browser -----------+
+                   v
+local MCP adapter -> HTTP capability protocol
+                          |
+                     Fastify server
+                       /       \
+                  SQLite     local images
 ```
 
 The React app is compiled to static files and served by the Fastify process. SQLite stores requests, ordered entries, pending actions, capabilities, and image metadata. Sanitized WebP files live in the data directory. A Docker deployment needs one container and one volume.
 
 ## Trust model
 
-There are no accounts in v0.1. A one-time claim URL grants one role on one request. Claiming it creates an expiring session credential. Only a SHA-256 digest of each secret is stored.
+There are no accounts in v0.1. A one-time claim URL grants one role on one request. Claiming it creates an expiring session credential. An exact retry may replay that session with the same claim-scoped exchange ID, while a different exchange remains rejected. Only a SHA-256 digest of each secret is stored.
 
 - Human and agent capabilities are separate.
 - Only the role targeted by the pending action can answer it.
@@ -42,9 +41,9 @@ Each mutation checks the client's expected request version. A stale client gets 
 
 ## Current shortcuts
 
-This alpha does not yet have idempotency keys, server-sent events, backup commands, account identity, or formal database/blob port interfaces. Image file writes and their metadata row are not one atomic operation yet. These are explicit v0.1 completion items, not hidden production claims.
+This alpha has a narrow idempotency key for retrying one-time claim exchange, but not yet for general mutations. It also does not yet have server-sent events, backup commands, account identity, or formal database/blob port interfaces. Image file writes and their metadata row are not one atomic operation yet. These are explicit v0.1 completion items, not hidden production claims.
 
-The browser polls while a request is open. The HTTP record shape is already client-neutral, so an MCP adapter can call the same endpoints without becoming part of the core server.
+The browser polls while a request is open. The stdio MCP adapter uses the same client-neutral HTTP records and stores only its scoped agent sessions. It is not part of the core server and needs no database, blob-store, or Redis access.
 
 ## Cloud path
 

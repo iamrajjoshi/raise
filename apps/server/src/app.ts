@@ -13,7 +13,7 @@ import {
 import Fastify, { type FastifyRequest } from "fastify";
 import { RaiseDatabase } from "./database.js";
 import { HttpError } from "./errors.js";
-import { prepareImages, storeImages } from "./images.js";
+import { prepareImages, renderAgentPreview, storeImages } from "./images.js";
 
 export interface AppOptions {
   databasePath: string;
@@ -84,12 +84,12 @@ export async function createApp(options: AppOptions) {
       : bodyTooLarge
         ? {
             code: "payload_too_large",
-            message: "That submission is too large. Use smaller screenshots or remove one.",
+            message: "That request is too large to send. Trim the text or use smaller screenshots.",
           }
         : validationIssues
           ? {
               code: "invalid_request",
-              message: "Check the request and try again.",
+              message: "We couldn’t read that request. Check what you entered and try again.",
               details: validationIssues,
             }
           : error instanceof HttpError
@@ -98,7 +98,7 @@ export async function createApp(options: AppOptions) {
                 message: error.message,
                 ...(error.details ? { details: error.details } : {}),
               }
-            : { code: "internal_error", message: "Something went wrong. Try again." };
+            : { code: "internal_error", message: "That didn’t work. Try again." };
     const statusCode =
       imagesTooLarge || bodyTooLarge
         ? 413
@@ -131,7 +131,7 @@ export async function createApp(options: AppOptions) {
 
   app.post("/api/claims", async (request, reply) => {
     const input = claimSchema.parse(request.body);
-    const claimed = db.exchangeClaim(input.token);
+    const claimed = db.exchangeClaim(input.token, input.expectedRole, input.exchangeId);
     if (input.mode === "cookie") {
       const secure = options.publicBaseUrl.startsWith("https://");
       reply.setCookie(`raise_session_${claimed.raiseId}`, claimed.sessionToken, {
@@ -141,14 +141,20 @@ export async function createApp(options: AppOptions) {
         path: "/",
         expires: new Date(claimed.expiresAt),
       });
-      return { raiseId: claimed.raiseId, role: claimed.role };
+      return { raiseId: claimed.raiseId, role: claimed.role, expiresAt: claimed.expiresAt };
     }
-    return { raiseId: claimed.raiseId, role: claimed.role, token: claimed.sessionToken };
+    return {
+      raiseId: claimed.raiseId,
+      role: claimed.role,
+      token: claimed.sessionToken,
+      expiresAt: claimed.expiresAt,
+    };
   });
 
   app.get<{ Params: { raiseId: string } }>("/api/raises/:raiseId", async (request) => {
     const token = bearerToken(request, request.params.raiseId);
-    if (!token) throw new HttpError(401, "unauthorized", "Open an access link for this request.");
+    if (!token)
+      throw new HttpError(401, "unauthorized", "Open this request from its original access link.");
     return db.getRaise(request.params.raiseId, token);
   });
 
@@ -156,7 +162,12 @@ export async function createApp(options: AppOptions) {
     "/api/raises/:raiseId/entries",
     async (request, reply) => {
       const token = bearerToken(request, request.params.raiseId);
-      if (!token) throw new HttpError(401, "unauthorized", "Open an access link for this request.");
+      if (!token)
+        throw new HttpError(
+          401,
+          "unauthorized",
+          "Open this request from its original access link.",
+        );
       const input = postEntrySchema.parse(request.body);
       db.assertCanPostEntry(request.params.raiseId, token, input);
       const images = await prepareImages(input.attachments);
@@ -172,26 +183,30 @@ export async function createApp(options: AppOptions) {
     },
   );
 
-  app.get<{ Params: { raiseId: string; attachmentId: string } }>(
-    "/api/raises/:raiseId/attachments/:attachmentId",
-    async (request, reply) => {
-      const token = bearerToken(request, request.params.raiseId);
-      if (!token)
-        throw new HttpError(401, "unauthorized", "Open an access link for this screenshot.");
-      const storageKey = db.getAttachment(
-        request.params.raiseId,
-        request.params.attachmentId,
-        token,
-      );
-      return reply.type("image/webp").send(createReadStream(storageKey));
-    },
-  );
+  app.get<{
+    Params: { raiseId: string; attachmentId: string };
+    Querystring: { preview?: string };
+  }>("/api/raises/:raiseId/attachments/:attachmentId", async (request, reply) => {
+    const token = bearerToken(request, request.params.raiseId);
+    if (!token)
+      throw new HttpError(401, "unauthorized", "Open the request before viewing this screenshot.");
+    const storageKey = db.getAttachment(request.params.raiseId, request.params.attachmentId, token);
+    if (request.query.preview === "mcp") {
+      return reply.type("image/webp").send(await renderAgentPreview(storageKey));
+    }
+    return reply.type("image/webp").send(createReadStream(storageKey));
+  });
 
   app.get<{ Params: { raiseId: string }; Querystring: { after?: string } }>(
     "/api/raises/:raiseId/changes",
     async (request, reply) => {
       const token = bearerToken(request, request.params.raiseId);
-      if (!token) throw new HttpError(401, "unauthorized", "Open an access link for this request.");
+      if (!token)
+        throw new HttpError(
+          401,
+          "unauthorized",
+          "Open this request from its original access link.",
+        );
       const view = db.getRaise(request.params.raiseId, token);
       const after = Number(request.query.after ?? 0);
       if (view.version <= after) return reply.code(204).send();

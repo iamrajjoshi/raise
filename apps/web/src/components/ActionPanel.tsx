@@ -39,7 +39,7 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
         </span>
         <div>
           <strong>Request closed</strong>
-          <p>This thread stays readable until its link expires.</p>
+          <p>You can still read it until the link expires.</p>
         </div>
       </section>
     );
@@ -50,7 +50,7 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
       <section className="review-panel" aria-labelledby="review-heading">
         <div className="review-heading">
           <h2 id="review-heading">Review result</h2>
-          <p>Use it as-is, or send it back with a note.</p>
+          <p>Keep it, or send it back with a note.</p>
         </div>
         {requestingChanges ? (
           <form
@@ -149,8 +149,8 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
           <h2>{isResult ? "Result" : "Reply"}</h2>
           <p>
             {isResult
-              ? "Add what changed, what you checked, and any screenshots."
-              : "Answer the question or paste in the missing context."}
+              ? "Say what changed and include anything worth checking."
+              : "Add whatever the agent asked for."}
           </p>
         </div>
         <Scratchpad
@@ -161,7 +161,9 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
           onSubmit={submitContent}
           label={isResult ? "Result summary" : "Reply"}
           placeholder={
-            isResult ? "What changed? Paste notes, links, or screenshots." : "Paste whatever helps."
+            isResult
+              ? "What changed? Add the details and any screenshots."
+              : "Paste whatever helps."
           }
           submitLabel={isResult ? "Send for review" : "Send"}
           busy={busy}
@@ -178,10 +180,8 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
     <section className="waiting-panel" role="status">
       <span className="waiting-pulse" aria-hidden="true" />
       <div>
-        <strong>
-          {raise.waitingOn === "agent" ? "Waiting for the agent" : "Waiting for the reviewer"}
-        </strong>
-        <p>Replies show up here when they arrive.</p>
+        <strong>{raise.waitingOn === "agent" ? "Agent’s turn" : "Human’s turn"}</strong>
+        <p>Leave this page open. The reply will appear here.</p>
       </div>
     </section>
   );

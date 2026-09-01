@@ -29,7 +29,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } | null;
     throw new RequestError(
       payload?.code ?? "request_failed",
-      payload?.message ?? "Something went wrong. Try again.",
+      payload?.message ?? "That didn’t work. Try again.",
     );
   }
   return response.json() as Promise<T>;
@@ -73,7 +73,7 @@ export async function imageFiles(files: File[]): Promise<AttachmentInput[]> {
             reject(
               new RequestError(
                 "file_read_failed",
-                `Couldn't add ${file.name}. Try that file again.`,
+                `Couldn’t add ${file.name}. Try that file again.`,
               ),
             );
           reader.onload = () =>

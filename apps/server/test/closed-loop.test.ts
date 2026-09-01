@@ -203,6 +203,78 @@ describe("Raise closed loop", () => {
     expect(crossRaise.statusCode).toBe(401);
   });
 
+  it("rejects the wrong role without consuming the claim", async () => {
+    const created = await create("human");
+    const wrongRole = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: {
+        token: claimToken(created.targetClaimUrl),
+        mode: "token",
+        expectedRole: "human",
+      },
+    });
+    expect(wrongRole.statusCode).toBe(403);
+    expect(wrongRole.json()).toMatchObject({ code: "wrong_role" });
+
+    const agentToken = await exchange(created.targetClaimUrl);
+    expect(agentToken).toMatch(/^ses_/);
+  });
+
+  it("replays one claim exchange ID but rejects a different exchange", async () => {
+    const created = await create("human");
+    const token = claimToken(created.targetClaimUrl);
+    const exchangeId = "claim-exchange-retry-0001";
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(first.statusCode).toBe(200);
+
+    await app.close();
+    app = await createApp({
+      databasePath,
+      dataDir,
+      publicBaseUrl: "http://raise.test",
+    });
+
+    const replay = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toEqual(first.json());
+
+    const [claimId] = token.split(".");
+    const forged = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: {
+        token: `${claimId}.${"A".repeat(43)}`,
+        mode: "token",
+        expectedRole: "agent",
+        exchangeId,
+      },
+    });
+    expect(forged.statusCode).toBe(401);
+    expect(forged.json()).toMatchObject({ code: "invalid_capability" });
+
+    const differentExchange = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: {
+        token,
+        mode: "token",
+        expectedRole: "agent",
+        exchangeId: "claim-exchange-retry-0002",
+      },
+    });
+    expect(differentExchange.statusCode).toBe(401);
+    expect(differentExchange.json()).toMatchObject({ code: "invalid_capability" });
+  });
+
   it("stores sanitized image bytes and serves them only with Raise access", async () => {
     const created = await create("human", true);
     const humanToken = await exchange(created.ownerClaimUrl);

@@ -4,7 +4,7 @@ Raise is a self-hosted context and review channel for people and coding agents.
 
 A person or agent creates a request and shares a role-specific link. The thread keeps text, page URLs, screenshots, agent results, and review decisions together. Requests expire after 24 hours by default.
 
-The current `0.1.0-alpha.1` build supports the first working loop:
+The current alpha supports the first working loop:
 
 - Start a request from one scratchpad in the web app, or from the API.
 - Paste text from a document, paste a screenshot, or drop a plain-text or Markdown file.
@@ -13,6 +13,7 @@ The current `0.1.0-alpha.1` build supports the first working loop:
 - Post an agent result.
 - Accept the result or ask for changes.
 - Store everything in SQLite and a local data directory.
+- Use the same loop from an MCP-compatible coding agent.
 
 ## Run locally
 
@@ -36,7 +37,7 @@ Open `http://localhost:8787`.
 
 ## Agent access
 
-Creating a request returns an access link for the other role. A coding agent can open its link in a browser or exchange the token for API access. See [HTTP protocol](docs/http-api.md).
+Build the repo, configure your MCP client to run `apps/mcp/dist/main.js`, and point `RAISE_BASE_URL` at the local or hosted Raise server. The agent can open a request for a human, claim a full URL pasted by a human, reply, and wait for the next turn. See [MCP adapter](docs/mcp.md) or the lower-level [HTTP protocol](docs/http-api.md).
 
 ## Project status
 

@@ -29,8 +29,7 @@ describe("scratchpad file intake", () => {
     });
 
     await expect(importTextFiles([file], "Existing note")).resolves.toEqual({
-      value:
-        "Existing note\n\n[Imported from: notes.md]\nCheck <script>alert('no')</script>\nthen retry",
+      value: "Existing note\n\n[From notes.md]\nCheck <script>alert('no')</script>\nthen retry",
       error: null,
     });
   });
@@ -50,7 +49,7 @@ describe("scratchpad file intake", () => {
     const result = await importTextFiles([file], "y".repeat(5_000));
 
     expect(result.value).toBe("y".repeat(5_000));
-    expect(result.error).toContain("too long");
+    expect(result.error).toContain("too much text");
   });
 
   it("cleans displayed filenames and explains PDF rejection", () => {

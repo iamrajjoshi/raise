@@ -33,11 +33,8 @@ export function ShareCard({ url, target }: { url: string; target: "agent" | "hum
   return (
     <aside className="share-card">
       <div className="share-copy">
-        <strong>{target === "agent" ? "Agent link" : "Reviewer link"}</strong>
-        <p>
-          It opens this request as the {target === "agent" ? "agent" : "reviewer"}. Copy it now; it
-          won’t appear again after this tab closes.
-        </p>
+        <strong>{target === "agent" ? "Send to the agent" : "Send to the human"}</strong>
+        <p>Copy this before you close the tab. Raise won’t show it again.</p>
         <code>{url}</code>
       </div>
       <button type="button" className="control control-secondary copy-button" onClick={copy}>

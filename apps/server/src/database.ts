@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import Database from "better-sqlite3";
 import type {
   ClaimResponse,
@@ -21,6 +21,11 @@ interface CapabilityRecord {
   secret_hash: string;
   consumed_at: string | null;
   expires_at: string;
+}
+
+interface ClaimExchangeRecord {
+  exchange_id: string;
+  session_capability_id: string;
 }
 
 interface RaiseRecord {
@@ -80,11 +85,21 @@ function encodeToken(kind: "claim" | "session", capabilityId: string, value: str
   return `${kind === "claim" ? "cap" : "ses"}_${capabilityId}.${value}`;
 }
 
+function exchangeSessionSecret(
+  claimSecret: string,
+  exchangeId: string,
+  sessionCapabilityId: string,
+): string {
+  return createHmac("sha256", claimSecret)
+    .update(`raise-claim-exchange-v1\0${exchangeId}\0${sessionCapabilityId}`)
+    .digest("base64url");
+}
+
 function parseToken(token: string, expectedKind: "claim" | "session") {
   const match = /^(cap|ses)_([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(token);
   const expectedPrefix = expectedKind === "claim" ? "cap" : "ses";
   if (!match || match[1] !== expectedPrefix) {
-    throw new HttpError(401, "invalid_capability", "This access link is invalid.");
+    throw new HttpError(401, "invalid_capability", "This link doesn’t work.");
   }
   return { id: match[2] as string, secret: match[3] as string };
 }
@@ -151,6 +166,13 @@ export class RaiseDatabase {
         created_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS claim_exchanges (
+        claim_id TEXT PRIMARY KEY REFERENCES capabilities(id) ON DELETE CASCADE,
+        exchange_id TEXT NOT NULL,
+        session_capability_id TEXT NOT NULL UNIQUE REFERENCES capabilities(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
         entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
@@ -186,13 +208,13 @@ export class RaiseDatabase {
     const promptTitle = input.prompt
       .split("\n")
       .map((line) => line.trim())
-      .find((line) => line && !/^\[Imported from: .+\]$/.test(line));
+      .find((line) => line && !/^\[From .+\]$/.test(line));
     const title =
       input.title ??
       promptTitle?.slice(0, 180) ??
       input.url?.slice(0, 180) ??
       input.attachments[0]?.name ??
-      "Untitled thread";
+      "Untitled request";
 
     const ownerClaim = this.newCapability(raiseId, ownerRole, "claim", expiresAt, createdAt);
     const targetClaim = this.newCapability(raiseId, targetRole, "claim", expiresAt, createdAt);
@@ -279,7 +301,11 @@ export class RaiseDatabase {
       );
   }
 
-  exchangeClaim(token: string): ClaimResponse & { sessionToken: string; expiresAt: string } {
+  exchangeClaim(
+    token: string,
+    expectedRole?: Role,
+    exchangeId?: string,
+  ): ClaimResponse & { sessionToken: string; expiresAt: string } {
     const parsed = parseToken(token, "claim");
     const now = new Date().toISOString();
 
@@ -288,24 +314,87 @@ export class RaiseDatabase {
         .prepare("SELECT * FROM capabilities WHERE id = ? AND kind = 'claim'")
         .get(parsed.id) as CapabilityRecord | undefined;
 
-      if (
-        !claim ||
-        claim.consumed_at ||
-        claim.expires_at <= now ||
-        !secretsMatch(parsed.secret, claim.secret_hash)
-      ) {
-        throw new HttpError(401, "invalid_capability", "This access link is invalid or expired.");
+      if (!claim || claim.expires_at <= now || !secretsMatch(parsed.secret, claim.secret_hash)) {
+        throw new HttpError(
+          401,
+          "invalid_capability",
+          "This link has expired or was already opened.",
+        );
+      }
+      if (expectedRole && claim.role !== expectedRole) {
+        throw new HttpError(
+          403,
+          "wrong_role",
+          `This link is for the ${claim.role}, not the ${expectedRole}.`,
+        );
+      }
+
+      const priorExchange = this.db
+        .prepare(
+          "SELECT exchange_id, session_capability_id FROM claim_exchanges WHERE claim_id = ?",
+        )
+        .get(claim.id) as ClaimExchangeRecord | undefined;
+      if (claim.consumed_at) {
+        if (!exchangeId || !priorExchange || priorExchange.exchange_id !== exchangeId) {
+          throw new HttpError(
+            401,
+            "invalid_capability",
+            "This link has expired or was already opened.",
+          );
+        }
+        const sessionSecret = exchangeSessionSecret(
+          parsed.secret,
+          exchangeId,
+          priorExchange.session_capability_id,
+        );
+        const session = this.db
+          .prepare("SELECT * FROM capabilities WHERE id = ? AND kind = 'session'")
+          .get(priorExchange.session_capability_id) as CapabilityRecord | undefined;
+        if (
+          !session ||
+          session.raise_id !== claim.raise_id ||
+          session.role !== claim.role ||
+          !secretsMatch(sessionSecret, session.secret_hash)
+        ) {
+          throw new Error("The stored claim exchange is incomplete.");
+        }
+        const sessionToken = encodeToken("session", session.id, sessionSecret);
+        return {
+          raiseId: claim.raise_id,
+          role: claim.role,
+          sessionToken,
+          token: sessionToken,
+          expiresAt: claim.expires_at,
+        };
       }
 
       this.db.prepare("UPDATE capabilities SET consumed_at = ? WHERE id = ?").run(now, claim.id);
-      const session = this.newCapability(
-        claim.raise_id,
-        claim.role,
-        "session",
-        claim.expires_at,
-        now,
-      );
+      const sessionCapabilityId = id("c");
+      const sessionSecret = exchangeId
+        ? exchangeSessionSecret(parsed.secret, exchangeId, sessionCapabilityId)
+        : secret();
+      const session = {
+        record: {
+          id: sessionCapabilityId,
+          raiseId: claim.raise_id,
+          role: claim.role,
+          kind: "session" as const,
+          secretHash: digest(sessionSecret),
+          expiresAt: claim.expires_at,
+          createdAt: now,
+        },
+        token: encodeToken("session", sessionCapabilityId, sessionSecret),
+      };
       this.insertCapability(session.record);
+      if (exchangeId) {
+        this.db
+          .prepare(
+            `INSERT INTO claim_exchanges
+             (claim_id, exchange_id, session_capability_id, created_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(claim.id, exchangeId, sessionCapabilityId, now);
+      }
 
       return {
         raiseId: claim.raise_id,
@@ -330,11 +419,7 @@ export class RaiseDatabase {
       !secretsMatch(parsed.secret, capability.secret_hash) ||
       (raiseId && capability.raise_id !== raiseId)
     ) {
-      throw new HttpError(
-        401,
-        "unauthorized",
-        "Your access to this request is missing or expired.",
-      );
+      throw new HttpError(401, "unauthorized", "Open this request from its original link.");
     }
 
     return {
@@ -349,7 +434,7 @@ export class RaiseDatabase {
     const raise = this.db.prepare("SELECT * FROM raises WHERE id = ?").get(raiseId) as
       RaiseRecord | undefined;
     if (!raise) {
-      throw new HttpError(404, "not_found", "This request does not exist.");
+      throw new HttpError(404, "not_found", "We couldn’t find this request.");
     }
 
     const now = new Date().toISOString();
@@ -473,7 +558,7 @@ export class RaiseDatabase {
     const raise = this.db.prepare("SELECT * FROM raises WHERE id = ?").get(raiseId) as
       RaiseRecord | undefined;
     if (!raise) {
-      throw new HttpError(404, "not_found", "This request does not exist.");
+      throw new HttpError(404, "not_found", "We couldn’t find this request.");
     }
     if (raise.lifecycle !== "open") {
       throw new HttpError(409, "raise_closed", "This request is closed.");
@@ -496,7 +581,7 @@ export class RaiseDatabase {
 
   private assertTransition(role: Role, pending: ActionRecord | undefined, input: PostEntryInput) {
     if (!pending || pending.target_role !== role) {
-      throw new HttpError(403, "not_your_turn", "It isn't your turn to reply.");
+      throw new HttpError(403, "not_your_turn", "It isn’t your turn to reply.");
     }
 
     const valid =
@@ -510,7 +595,7 @@ export class RaiseDatabase {
       throw new HttpError(
         409,
         "invalid_transition",
-        "This reply does not match the current step. Reload and try again.",
+        "You can’t send that at this point in the request. Reload and try again.",
       );
     }
   }
@@ -580,7 +665,7 @@ export class RaiseDatabase {
       .prepare("SELECT storage_key FROM attachments WHERE id = ? AND raise_id = ?")
       .get(attachmentId, raiseId) as { storage_key: string } | undefined;
     if (!record) {
-      throw new HttpError(404, "not_found", "This screenshot does not exist.");
+      throw new HttpError(404, "not_found", "We couldn’t find that screenshot.");
     }
     return record.storage_key;
   }

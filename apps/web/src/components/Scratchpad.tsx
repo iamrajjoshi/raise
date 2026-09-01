@@ -19,6 +19,7 @@ import {
   screenshotBudgetMessage,
   unsupportedFileMessage,
 } from "../lib/intake";
+import { Screenshot } from "./Screenshot";
 
 interface ScratchpadProps {
   value: string;
@@ -89,7 +90,7 @@ export function Scratchpad({
         problems.push(
           caught instanceof RequestError
             ? caught.message
-            : "Couldn’t add that screenshot. Try another copy.",
+            : "That screenshot didn’t come through. Paste it again or choose the file.",
         );
       }
     }
@@ -131,7 +132,7 @@ export function Scratchpad({
     const droppedText = event.dataTransfer.getData("text/plain");
     const nextValue = appendPlainText(valueRef.current, droppedText);
     if (nextValue.length > maxBodyLength) {
-      setFileError("That text is too long. Paste the part you need.");
+      setFileError("That’s too much text at once. Paste only the parts you need.");
     } else if (nextValue !== valueRef.current) {
       setFileError(null);
       valueRef.current = nextValue;
@@ -193,22 +194,14 @@ export function Scratchpad({
         {images.length > 0 && (
           <div className="attachment-previews" aria-label="Attached screenshots">
             {images.map((image, index) => (
-              <figure className="attachment-preview" key={`${image.name}-${index}`}>
-                <img src={image.dataUrl} alt="" />
-                <figcaption>{image.name}</figcaption>
-                <button
-                  type="button"
-                  className="control control-icon control-quiet attachment-remove"
-                  aria-label={`Remove ${image.name}`}
-                  onClick={() =>
-                    onImagesChange(images.filter((_, itemIndex) => itemIndex !== index))
-                  }
-                >
-                  <span className="control-glyph" aria-hidden="true">
-                    ×
-                  </span>
-                </button>
-              </figure>
+              <Screenshot
+                src={image.dataUrl}
+                name={image.name}
+                key={`${image.name}-${index}`}
+                onRemove={() =>
+                  onImagesChange(images.filter((_, itemIndex) => itemIndex !== index))
+                }
+              />
             ))}
           </div>
         )}

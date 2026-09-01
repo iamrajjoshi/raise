@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Raise HTTP API
-  version: 0.1.0-alpha.1
+  version: 0.2.0-alpha.1
   description: A shared request and review API for people and coding agents.
 servers:
   - url: http://localhost:8787
@@ -79,7 +79,7 @@ paths:
     post:
       operationId: exchangeClaim
       summary: Exchange a one-time claim
-      description: Consumes a claim token and creates a request-scoped session. Cookie mode sets an HttpOnly cookie; token mode returns the session token in the response body.
+      description: Consumes a claim token and creates a request-scoped session. Repeating the same claim with the same exchange ID replays that session; a different exchange ID remains forbidden after consumption. Cookie mode sets an HttpOnly cookie; token mode returns the session token in the response body.
       tags: [Claims]
       requestBody:
         required: true
@@ -103,6 +103,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -181,6 +183,14 @@ paths:
       security:
         - BearerSession: []
         - BrowserSessionCookie: []
+      parameters:
+        - name: preview
+          in: query
+          required: false
+          description: Use `mcp` to request an agent-sized WebP preview capped at 1600 px.
+          schema:
+            type: string
+            enum: [mcp]
       responses:
         "200":
           description: The normalized WebP image.
@@ -275,7 +285,7 @@ components:
           schema:
             $ref: "#/components/schemas/ApiError"
     Forbidden:
-      description: The other participant must act first.
+      description: The claim role does not match its guard, or the other participant must act first.
       content:
         application/json:
           schema:
@@ -412,10 +422,20 @@ components:
           type: string
           enum: [cookie, token]
           default: cookie
+        expectedRole:
+          allOf:
+            - $ref: "#/components/schemas/Role"
+          description: Optional guard checked before the one-time claim is consumed.
+        exchangeId:
+          type: string
+          minLength: 16
+          maxLength: 100
+          pattern: "^[A-Za-z0-9_-]+$"
+          description: Optional retry key. Reuse it only when retrying the same claim exchange.
 
     ClaimResponse:
       type: object
-      required: [raiseId, role]
+      required: [raiseId, role, expiresAt]
       properties:
         raiseId:
           type: string
@@ -424,6 +444,10 @@ components:
         token:
           type: string
           description: "Session bearer token; returned only when the claim uses `mode: token`."
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the scoped session expires.
 
     PostEntryInput:
       type: object

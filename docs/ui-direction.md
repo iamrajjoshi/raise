@@ -20,7 +20,7 @@ Raise is a work surface for one request. It should feel like opening a clean she
 Raise is the product name. The objects inside it are requests, threads, replies, results, screenshots, and links. Do not turn the product name into a countable noun.
 
 - Screen titles name the job: `New request` and `Review the result`.
-- Status copy says who acts next: `Your turn`, `Waiting for the agent`, `Waiting for the reviewer`, or `Closed`.
+- Status copy says who acts next: `Your turn`, `Agent’s turn`, `Human’s turn`, or `Closed`.
 - Examples should look like real bug reports. Include a route, breakpoint, or observed behavior when it helps.
 - Security copy states what a link permits and when the request disappears. Do not make broad claims such as “private” or “secure.”
 - Errors say what failed and what to try next. Do not apologize, blame the user, or expose internal names.
@@ -44,7 +44,7 @@ Check the current license and add a notice before copying third-party source. Ra
 
 ## Main surfaces
 
-`/new` is one full-height dispatch sheet, not a stack of fields or a textarea card. The first non-empty line becomes the thread title. People can paste plain text from Word, Google Docs, email, or a web page without cleaning it up first. They can paste screenshots anywhere in the sheet or drop `.txt`, `.md`, and `.markdown` files; text-file contents become editable text and the original file is not uploaded. Links stay in the notes instead of going through an affected-page field. After creation, the person stays in the reviewer session and sees the agent link once.
+`/new` is one full-height dispatch sheet, not a stack of fields or a textarea card. The first non-empty line becomes the request title. People can paste plain text from Word, Google Docs, email, or a web page without cleaning it up first. They can paste screenshots anywhere in the sheet or drop `.txt`, `.md`, and `.markdown` files; text-file contents become editable text and the original file is not uploaded. Links stay in the notes instead of going through an affected-page field. After creation, the person stays in the human session and sees the agent link once.
 
 Replies and results reuse the same compact scratchpad. Keep screenshot previews, file feedback, the attach control, and the send action inside its border. Screenshots have a 15 MiB combined budget per send instead of a visible count limit. PDF and DOCX files are not accepted as uploads in v0.1; the person can paste the relevant text.
 

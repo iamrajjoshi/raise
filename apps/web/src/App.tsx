@@ -93,9 +93,7 @@ function NewRaisePage() {
       window.location.assign(`/r/${result.raiseId}`);
     } catch (caught) {
       setError(
-        caught instanceof RequestError
-          ? caught.message
-          : "We couldn't create the request. Try again.",
+        caught instanceof RequestError ? caught.message : "Couldn’t start the request. Try again.",
       );
       setBusy(false);
     }
@@ -111,14 +109,16 @@ function NewRaisePage() {
           onImagesChange={setImages}
           onSubmit={submit}
           label="Request"
-          placeholder="Paste notes, links, screenshots, or the whole messy thread."
+          placeholder="Paste whatever you’ve got: notes, links, screenshots, even the whole messy thread."
           submitLabel="Send"
           busyLabel="Sending…"
           busy={busy}
           canSubmit={Boolean(prompt.trim() || images.length)}
           error={error}
           autoFocus
-          note={<>Anyone with the link can open it. Deleted in 24 hours.</>}
+          note={
+            <>Send the link only to the person you want to answer. It expires after 24 hours.</>
+          }
         />
       </main>
     </AppFrame>
@@ -144,16 +144,20 @@ function RaisePage({ raiseId }: { raiseId: string }) {
       try {
         const token = claimTokenFromHash();
         if (token) {
-          await claimRaise(token);
+          try {
+            await claimRaise(token);
+          } catch (caught) {
+            if (!(caught instanceof RequestError && caught.code === "invalid_capability")) {
+              throw caught;
+            }
+          }
           window.history.replaceState(null, "", `/r/${raiseId}`);
         }
         const view = await load();
         if (active) setRaise(view);
       } catch (caught) {
         if (active) {
-          setFatal(
-            caught instanceof RequestError ? caught.message : "This request could not be opened.",
-          );
+          setFatal(caught instanceof RequestError ? caught.message : "Couldn’t open this request.");
         }
       } finally {
         if (active) setLoading(false);
@@ -181,9 +185,7 @@ function RaisePage({ raiseId }: { raiseId: string }) {
       setRaise(updated);
       return true;
     } catch (caught) {
-      setError(
-        caught instanceof RequestError ? caught.message : "We couldn't send that. Try again.",
-      );
+      setError(caught instanceof RequestError ? caught.message : "That didn’t send. Try again.");
       if (caught instanceof RequestError && caught.code === "state_conflict") await load();
       return false;
     } finally {
@@ -208,10 +210,10 @@ function RaisePage({ raiseId }: { raiseId: string }) {
     return (
       <AppFrame className="app-shell-record" showNewRequest>
         <main className="error-state">
-          <h1>Link unavailable</h1>
-          <p>{fatal ?? "This link is invalid, expired, or already used."}</p>
+          <h1>This link doesn’t work</h1>
+          <p>{fatal ?? "It may have expired or already been opened."}</p>
           <a className="control control-primary" href="/">
-            Create request
+            Start a request
           </a>
         </main>
       </AppFrame>
@@ -229,14 +231,14 @@ function RaisePage({ raiseId }: { raiseId: string }) {
           : raise.waitingOn === raise.viewerRole
             ? "Your turn"
             : raise.waitingOn === "agent"
-              ? "Waiting for the agent"
-              : "Waiting for the reviewer";
+              ? "Agent’s turn"
+              : "Human’s turn";
   const actionLabel = raise.pendingAction
     ? {
-        provide_context: "Add requested details",
-        perform_work: "Post a result",
+        provide_context: "Add the missing details",
+        perform_work: "Send a result",
         review_result: "Review the result",
-        make_changes: "Post an updated result",
+        make_changes: "Send the update",
       }[raise.pendingAction]
     : null;
 
@@ -253,12 +255,12 @@ function RaisePage({ raiseId }: { raiseId: string }) {
           <h1>{raise.title}</h1>
           <dl className="record-meta">
             <div>
-              <dt>Next</dt>
-              <dd>{actionLabel ?? "Nothing"}</dd>
+              <dt>Next up</dt>
+              <dd>{actionLabel ?? "All done"}</dd>
             </div>
             <div>
-              <dt>Open as</dt>
-              <dd>{raise.viewerRole === "human" ? "Reviewer" : "Agent"}</dd>
+              <dt>Viewing as</dt>
+              <dd>{raise.viewerRole === "human" ? "Human" : "Agent"}</dd>
             </div>
             <div>
               <dt>Created</dt>
@@ -290,9 +292,10 @@ function NotFoundPage() {
   return (
     <AppFrame className="app-shell-record" showNewRequest>
       <main className="error-state">
-        <h1>Page not found</h1>
+        <h1>Nothing here</h1>
+        <p>That page doesn’t exist.</p>
         <a className="control control-primary" href="/">
-          Create request
+          Start a request
         </a>
       </main>
     </AppFrame>

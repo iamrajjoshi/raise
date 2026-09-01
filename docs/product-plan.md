@@ -258,15 +258,17 @@ Question-and-answer alone can be replaced by native agent prompts. v0.1 tests th
 
 ### MCP surface
 
-| Tool           | Purpose                                                                                    |
-| -------------- | ------------------------------------------------------------------------------------------ |
-| `raise_open`   | Create a request and one action request                                                    |
-| `raise_read`   | Read entries, artifacts, actions, and lifecycle                                            |
-| `raise_reply`  | Add a reply or basic result                                                                |
-| `raise_wait`   | Wait for a bounded period or return a task handle                                          |
-| `raise_update` | Answer, request review, accept, request changes, resolve, reopen, or cancel when permitted |
+| Tool               | Purpose                                                                             |
+| ------------------ | ----------------------------------------------------------------------------------- |
+| `raise_open`       | Create a request and one action request                                             |
+| `raise_claim`      | Exchange a full claim URL pasted into the agent and keep the scoped session locally |
+| `raise_read`       | Read entries, artifacts, actions, and lifecycle                                     |
+| `raise_reply`      | Add a reply or basic result                                                         |
+| `raise_screenshot` | Retrieve one authenticated agent-sized screenshot                                   |
+| `raise_wait`       | Wait for a bounded period or return a task handle                                   |
+| `raise_update`     | Add a side note without advancing the pending action                                |
 
-Use the [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview) as the durable asynchronous handle where supported. Each MCP task represents one outstanding action request because a completed task is terminal and cannot later reopen with its parent Raise. Return the one-time responder claim URL as ordinary tool content for clients that need a browser handoff.
+The first adapter uses bounded `raise_wait` polling because it works across current MCP hosts and keeps the server deployment simple. MCP Tasks can be added later when host support is broad enough to justify a second asynchronous path. Return the one-time responder claim URL as ordinary tool content for clients that need a browser handoff.
 
 Do not place a secret bearer link into MCP URL-mode elicitation. The [elicitation security rules](https://modelcontextprotocol.io/specification/2026-07-28/client/elicitation#safe-url-handling) forbid URLs that pre-authenticate access to protected resources. URL-mode elicitation is suitable only for a login or pairing destination without the capability secret.
 

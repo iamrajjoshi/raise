@@ -6,7 +6,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],
-      include: ["apps/server/src/**/*.ts", "packages/protocol/src/**/*.ts"],
+      include: ["apps/mcp/src/**/*.ts", "apps/server/src/**/*.ts", "packages/protocol/src/**/*.ts"],
     },
   },
 });

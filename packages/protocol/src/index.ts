@@ -21,7 +21,7 @@ export type Decision = z.infer<typeof decisionSchema>;
 export const maxAttachmentsPerEntry = 32;
 export const maxAttachmentBytesPerEntry = 15 * 1_024 * 1_024;
 export const attachmentBudgetMessage =
-  "Those screenshots add up to more than 15 MB. Use smaller copies or remove one.";
+  "Those screenshots are over the 15 MB limit together. Try smaller copies or remove one.";
 
 export function dataUrlByteLength(dataUrl: string): number {
   const commaIndex = dataUrl.indexOf(",");
@@ -70,7 +70,7 @@ export const createRaiseSchema = z
       context.addIssue({
         code: "custom",
         path: ["prompt"],
-        message: "Add text, a URL, or an image.",
+        message: "Add some text, a link, or a screenshot.",
       });
     }
   });
@@ -79,6 +79,11 @@ export type CreateRaiseInput = z.infer<typeof createRaiseSchema>;
 export const claimSchema = z.object({
   token: z.string().min(20).max(400),
   mode: z.enum(["cookie", "token"]).default("cookie"),
+  expectedRole: roleSchema.optional(),
+  exchangeId: z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{16,100}$/)
+    .optional(),
 });
 export type ClaimInput = z.infer<typeof claimSchema>;
 
@@ -93,7 +98,11 @@ export const postEntrySchema = z
   })
   .superRefine((value, context) => {
     if (value.kind === "review_decision" && !value.decision) {
-      context.addIssue({ code: "custom", path: ["decision"], message: "A decision is required." });
+      context.addIssue({
+        code: "custom",
+        path: ["decision"],
+        message: "Choose accept or ask for changes.",
+      });
     }
     if (value.decision === "request_changes" && !value.body) {
       context.addIssue({
@@ -111,7 +120,7 @@ export const postEntrySchema = z
       context.addIssue({
         code: "custom",
         path: ["body"],
-        message: "Add text, a URL, or an image.",
+        message: "Add some text, a link, or a screenshot.",
       });
     }
   });
@@ -172,6 +181,7 @@ export interface ClaimResponse {
   raiseId: string;
   role: Role;
   token?: string;
+  expiresAt: string;
 }
 
 export interface ApiError {
