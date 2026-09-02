@@ -1,3 +1,5 @@
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -13,6 +15,18 @@ const requestTitle = "Billing empty state is clipped on mobile";
 
 function claimToken(url: string) {
   return new URL(url).hash.slice("#token=".length);
+}
+
+function replaySecret() {
+  return randomBytes(32).toString("base64url");
+}
+
+async function expectDatabaseArtifactsNotToContain(databasePath: string, sentinel: Buffer) {
+  for (const artifact of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    if (existsSync(artifact)) {
+      expect((await readFile(artifact)).includes(sentinel), artifact).toBe(false);
+    }
+  }
 }
 
 describe("Raise closed loop", () => {
@@ -224,13 +238,28 @@ describe("Raise closed loop", () => {
   it("replays one claim exchange ID but rejects a different exchange", async () => {
     const created = await create("human");
     const token = claimToken(created.targetClaimUrl);
-    const exchangeId = "claim-exchange-retry-0001";
+    const exchangeId = replaySecret();
     const first = await app.inject({
       method: "POST",
       url: "/api/claims",
       payload: { token, mode: "token", expectedRole: "agent", exchangeId },
     });
     expect(first.statusCode).toBe(200);
+
+    const inspection = new Database(databasePath, { readonly: true });
+    const storedExchange = inspection
+      .prepare("SELECT exchange_id, exchange_id_hash, exchange_mode FROM claim_exchanges")
+      .get() as {
+      exchange_id: string;
+      exchange_id_hash: string;
+      exchange_mode: string;
+    };
+    inspection.close();
+    expect(storedExchange).toEqual({
+      exchange_id: "",
+      exchange_id_hash: createHash("sha256").update(exchangeId).digest("hex"),
+      exchange_mode: "token",
+    });
 
     await app.close();
     app = await createApp({
@@ -268,11 +297,196 @@ describe("Raise closed loop", () => {
         token,
         mode: "token",
         expectedRole: "agent",
-        exchangeId: "claim-exchange-retry-0002",
+        exchangeId: replaySecret(),
       },
     });
     expect(differentExchange.statusCode).toBe(401);
     expect(differentExchange.json()).toMatchObject({ code: "invalid_capability" });
+  });
+
+  it("binds a claim replay to its original delivery mode", async () => {
+    const created = await create("human");
+    const token = claimToken(created.targetClaimUrl);
+    const exchangeId = replaySecret();
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "cookie", expectedRole: "agent", exchangeId },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json<ClaimResponse>().token).toBeUndefined();
+    expect(first.headers["set-cookie"]).toContain("raise_session_");
+
+    const tokenReplay = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(tokenReplay.statusCode).toBe(401);
+    expect(tokenReplay.json()).toMatchObject({ code: "invalid_capability" });
+
+    const cookieReplay = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "cookie", expectedRole: "agent", exchangeId },
+    });
+    expect(cookieReplay.statusCode).toBe(200);
+    expect(cookieReplay.json()).toEqual(first.json());
+    expect(cookieReplay.headers["set-cookie"]).toBe(first.headers["set-cookie"]);
+  });
+
+  it("invalidates every pre-mode claim replay while preserving its existing session", async () => {
+    const created = await create("human");
+    const token = claimToken(created.targetClaimUrl);
+    const exchangeId = createHash("sha256")
+      .update("raise-claim-exchange-v1\0")
+      .update(token)
+      .digest("base64url");
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(first.statusCode).toBe(200);
+    const originalSession = first.json<ClaimResponse>().token as string;
+    await app.close();
+
+    const legacyDatabase = new Database(databasePath);
+    const exchange = legacyDatabase
+      .prepare("SELECT claim_id, session_capability_id, created_at FROM claim_exchanges")
+      .get() as {
+      claim_id: string;
+      session_capability_id: string;
+      created_at: string;
+    };
+    legacyDatabase.pragma("foreign_keys = OFF");
+    legacyDatabase.exec("DROP TABLE claim_exchanges");
+    legacyDatabase.exec(`
+      CREATE TABLE claim_exchanges (
+        claim_id TEXT PRIMARY KEY REFERENCES capabilities(id) ON DELETE CASCADE,
+        exchange_id TEXT NOT NULL,
+        session_capability_id TEXT NOT NULL UNIQUE REFERENCES capabilities(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      )
+    `);
+    legacyDatabase
+      .prepare(
+        `INSERT INTO claim_exchanges
+         (claim_id, exchange_id, session_capability_id, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(exchange.claim_id, exchangeId, exchange.session_capability_id, exchange.created_at);
+    legacyDatabase.close();
+    const sentinel = Buffer.from(exchangeId);
+    expect((await readFile(databasePath)).includes(sentinel)).toBe(true);
+
+    app = await createApp({
+      databasePath,
+      dataDir,
+      publicBaseUrl: "http://raise.test",
+    });
+    await expectDatabaseArtifactsNotToContain(databasePath, sentinel);
+    if (existsSync(`${databasePath}-wal`)) {
+      expect((await readFile(`${databasePath}-wal`)).byteLength).toBe(0);
+    }
+
+    const migratedDatabase = new Database(databasePath, { readonly: true });
+    const exchangeCount = migratedDatabase
+      .prepare("SELECT COUNT(*) AS count FROM claim_exchanges")
+      .get() as { count: number };
+    const claim = migratedDatabase
+      .prepare("SELECT consumed_at FROM capabilities WHERE id = ?")
+      .get(exchange.claim_id) as { consumed_at: string | null };
+    const session = migratedDatabase
+      .prepare("SELECT id FROM capabilities WHERE id = ? AND kind = 'session'")
+      .get(exchange.session_capability_id) as { id: string } | undefined;
+    const columns = migratedDatabase.pragma("table_info(claim_exchanges)") as Array<{
+      name: string;
+    }>;
+    migratedDatabase.close();
+    expect(exchangeCount.count).toBe(0);
+    expect(claim.consumed_at).not.toBeNull();
+    expect(session?.id).toBe(exchange.session_capability_id);
+    expect(columns.map((column) => column.name)).toEqual(
+      expect.arrayContaining(["exchange_id_hash", "exchange_mode"]),
+    );
+
+    await app.close();
+    await expectDatabaseArtifactsNotToContain(databasePath, sentinel);
+    app = await createApp({
+      databasePath,
+      dataDir,
+      publicBaseUrl: "http://raise.test",
+    });
+
+    const existingSession = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}`,
+      headers: auth(originalSession),
+    });
+    expect(existingSession.statusCode).toBe(200);
+
+    const tokenReplay = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(tokenReplay.statusCode).toBe(401);
+    expect(tokenReplay.json()).toMatchObject({ code: "invalid_capability" });
+
+    const cookieReplay = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "cookie", expectedRole: "agent", exchangeId },
+    });
+    expect(cookieReplay.statusCode).toBe(401);
+    expect(cookieReplay.json()).toMatchObject({ code: "invalid_capability" });
+  });
+
+  it("rolls back the whole first exchange if replay persistence fails", async () => {
+    const created = await create("human");
+    const token = claimToken(created.targetClaimUrl);
+    const claimId = token.slice(0, token.indexOf(".")).slice("cap_".length);
+    const exchangeId = replaySecret();
+    const inspection = new Database(databasePath);
+    inspection.exec(`
+      CREATE TRIGGER reject_claim_exchange
+      BEFORE INSERT ON claim_exchanges
+      BEGIN
+        SELECT RAISE(ABORT, 'injected exchange failure');
+      END
+    `);
+    inspection.close();
+
+    const failed = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(failed.statusCode).toBe(500);
+
+    const afterFailure = new Database(databasePath);
+    const claim = afterFailure
+      .prepare("SELECT consumed_at FROM capabilities WHERE id = ?")
+      .get(claimId) as { consumed_at: string | null };
+    const sessionCount = afterFailure
+      .prepare("SELECT COUNT(*) AS count FROM capabilities WHERE kind = 'session'")
+      .get() as { count: number };
+    const exchangeCount = afterFailure
+      .prepare("SELECT COUNT(*) AS count FROM claim_exchanges")
+      .get() as { count: number };
+    expect(claim.consumed_at).toBeNull();
+    expect(sessionCount.count).toBe(0);
+    expect(exchangeCount.count).toBe(0);
+    afterFailure.exec("DROP TRIGGER reject_claim_exchange");
+    afterFailure.close();
+
+    const retry = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+    });
+    expect(retry.statusCode).toBe(200);
   });
 
   it("stores sanitized image bytes and serves them only with Raise access", async () => {

@@ -1,11 +1,14 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import Database from "better-sqlite3";
 import type {
+  ClaimMode,
   ClaimResponse,
   CreateRaiseInput,
   CreateRaiseResponse,
   Decision,
   EntryKind,
+  InboxItem,
+  InboxResponse,
   PendingActionKind,
   PostEntryInput,
   RaiseView,
@@ -24,7 +27,8 @@ interface CapabilityRecord {
 }
 
 interface ClaimExchangeRecord {
-  exchange_id: string;
+  exchange_id_hash: string | null;
+  exchange_mode: ClaimMode | null;
   session_capability_id: string;
 }
 
@@ -61,6 +65,12 @@ interface AttachmentRecord {
   display_name: string;
   width: number;
   height: number;
+}
+
+interface WalCheckpointRecord {
+  busy: number;
+  log: number;
+  checkpointed: number;
 }
 
 function id(prefix: string): string {
@@ -109,9 +119,14 @@ export class RaiseDatabase {
 
   constructor(databasePath: string) {
     this.db = new Database(databasePath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("foreign_keys = ON");
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close() {
@@ -168,7 +183,9 @@ export class RaiseDatabase {
 
       CREATE TABLE IF NOT EXISTS claim_exchanges (
         claim_id TEXT PRIMARY KEY REFERENCES capabilities(id) ON DELETE CASCADE,
-        exchange_id TEXT NOT NULL,
+        exchange_id TEXT NOT NULL DEFAULT '',
+        exchange_id_hash TEXT,
+        exchange_mode TEXT CHECK (exchange_mode IN ('cookie', 'token')),
         session_capability_id TEXT NOT NULL UNIQUE REFERENCES capabilities(id) ON DELETE CASCADE,
         created_at TEXT NOT NULL
       );
@@ -189,6 +206,52 @@ export class RaiseDatabase {
     const raiseColumns = this.db.pragma("table_info(raises)") as Array<{ name: string }>;
     if (!raiseColumns.some((column) => column.name === "title")) {
       this.db.exec("ALTER TABLE raises ADD COLUMN title TEXT NOT NULL DEFAULT ''");
+    }
+
+    const exchangeColumns = this.db.pragma("table_info(claim_exchanges)") as Array<{
+      name: string;
+    }>;
+    const hadExchangeIdHash = exchangeColumns.some((column) => column.name === "exchange_id_hash");
+    const hadExchangeMode = exchangeColumns.some((column) => column.name === "exchange_mode");
+    const hasLegacyExchanges = !hadExchangeIdHash || !hadExchangeMode;
+    const previousSecureDelete = this.db.pragma("secure_delete", { simple: true }) as number;
+    if (hasLegacyExchanges) this.db.pragma("secure_delete = ON");
+    try {
+      this.db.transaction(() => {
+        if (!hadExchangeIdHash) {
+          this.db.exec("ALTER TABLE claim_exchanges ADD COLUMN exchange_id_hash TEXT");
+        }
+        if (!hadExchangeMode) {
+          this.db.exec(
+            "ALTER TABLE claim_exchanges ADD COLUMN exchange_mode TEXT CHECK (exchange_mode IN ('cookie', 'token'))",
+          );
+        }
+
+        if (hasLegacyExchanges) {
+          this.db.prepare("DELETE FROM claim_exchanges").run();
+        } else {
+          this.db
+            .prepare(
+              "DELETE FROM claim_exchanges WHERE exchange_id_hash IS NULL OR exchange_mode IS NULL",
+            )
+            .run();
+          this.db
+            .prepare("UPDATE claim_exchanges SET exchange_id = '' WHERE exchange_id != ''")
+            .run();
+        }
+      })();
+
+      if (hasLegacyExchanges) {
+        const checkpoints = this.db.pragma("wal_checkpoint(TRUNCATE)") as WalCheckpointRecord[];
+        const checkpoint = checkpoints[0];
+        if (!checkpoint || checkpoint.busy !== 0) {
+          throw new Error("Could not securely finish the legacy claim exchange migration.");
+        }
+      }
+    } finally {
+      const secureDeleteMode =
+        previousSecureDelete === 2 ? "FAST" : previousSecureDelete === 1 ? "ON" : "OFF";
+      this.db.pragma(`secure_delete = ${secureDeleteMode}`);
     }
   }
 
@@ -303,6 +366,7 @@ export class RaiseDatabase {
 
   exchangeClaim(
     token: string,
+    mode: ClaimMode,
     expectedRole?: Role,
     exchangeId?: string,
   ): ClaimResponse & { sessionToken: string; expiresAt: string } {
@@ -331,11 +395,17 @@ export class RaiseDatabase {
 
       const priorExchange = this.db
         .prepare(
-          "SELECT exchange_id, session_capability_id FROM claim_exchanges WHERE claim_id = ?",
+          `SELECT exchange_id_hash, exchange_mode, session_capability_id
+           FROM claim_exchanges WHERE claim_id = ?`,
         )
         .get(claim.id) as ClaimExchangeRecord | undefined;
       if (claim.consumed_at) {
-        if (!exchangeId || !priorExchange || priorExchange.exchange_id !== exchangeId) {
+        if (
+          !exchangeId ||
+          !priorExchange?.exchange_id_hash ||
+          priorExchange.exchange_mode !== mode ||
+          !secretsMatch(exchangeId, priorExchange.exchange_id_hash)
+        ) {
           throw new HttpError(
             401,
             "invalid_capability",
@@ -390,10 +460,10 @@ export class RaiseDatabase {
         this.db
           .prepare(
             `INSERT INTO claim_exchanges
-             (claim_id, exchange_id, session_capability_id, created_at)
-             VALUES (?, ?, ?, ?)`,
+             (claim_id, exchange_id, exchange_id_hash, exchange_mode, session_capability_id, created_at)
+             VALUES (?, '', ?, ?, ?, ?)`,
           )
-          .run(claim.id, exchangeId, sessionCapabilityId, now);
+          .run(claim.id, digest(exchangeId), mode, sessionCapabilityId, now);
       }
 
       return {
@@ -402,6 +472,83 @@ export class RaiseDatabase {
         sessionToken: session.token,
         token: session.token,
         expiresAt: claim.expires_at,
+      };
+    })();
+  }
+
+  getInbox(limit: number): InboxResponse {
+    const now = new Date().toISOString();
+    const records = this.db
+      .prepare(
+        `SELECT
+           raises.id AS raise_id,
+           raises.title,
+           raises.origin,
+           raises.version,
+           raises.created_at,
+           raises.updated_at,
+           raises.expires_at,
+           action_requests.target_role,
+           action_requests.kind AS pending_action
+         FROM raises
+         LEFT JOIN action_requests
+           ON action_requests.raise_id = raises.id AND action_requests.state = 'pending'
+         WHERE raises.lifecycle = 'open' AND raises.expires_at > ?
+         ORDER BY
+           CASE WHEN action_requests.target_role = 'agent' THEN 0 ELSE 1 END,
+           raises.updated_at DESC,
+           raises.id ASC
+         LIMIT ?`,
+      )
+      .all(now, limit) as Array<{
+      raise_id: string;
+      title: string;
+      origin: Role;
+      version: number;
+      created_at: string;
+      updated_at: string;
+      expires_at: string;
+      target_role: Role | null;
+      pending_action: PendingActionKind | null;
+    }>;
+
+    const items: InboxItem[] = records.map((record) => ({
+      raiseId: record.raise_id,
+      title: record.title || record.raise_id,
+      origin: record.origin,
+      waitingOn: record.target_role,
+      pendingAction: record.pending_action,
+      version: record.version,
+      createdAt: record.created_at,
+      updatedAt: record.updated_at,
+      expiresAt: record.expires_at,
+    }));
+    return { items };
+  }
+
+  createInboxSession(raiseId: string): ClaimResponse & { token: string } {
+    const now = new Date().toISOString();
+
+    return this.db.transaction(() => {
+      const raise = this.db.prepare("SELECT * FROM raises WHERE id = ?").get(raiseId) as
+        RaiseRecord | undefined;
+      if (!raise) {
+        throw new HttpError(404, "not_found", "We couldn’t find this request.");
+      }
+      if (raise.lifecycle === "expired" || raise.expires_at <= now) {
+        throw new HttpError(410, "raise_expired", "This request has expired.");
+      }
+      if (raise.lifecycle !== "open") {
+        throw new HttpError(409, "raise_closed", "This request is closed.");
+      }
+
+      const session = this.newCapability(raise.id, "agent", "session", raise.expires_at, now);
+      this.insertCapability(session.record);
+      return {
+        raiseId: raise.id,
+        role: "agent" as const,
+        token: session.token,
+        expiresAt: raise.expires_at,
       };
     })();
   }

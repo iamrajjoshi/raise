@@ -18,6 +18,14 @@ export type EntryKind = z.infer<typeof entryKindSchema>;
 export const decisionSchema = z.enum(["accept", "request_changes"]);
 export type Decision = z.infer<typeof decisionSchema>;
 
+export const pendingActionKindSchema = z.enum([
+  "provide_context",
+  "perform_work",
+  "review_result",
+  "make_changes",
+]);
+export type PendingActionKind = z.infer<typeof pendingActionKindSchema>;
+
 export const maxAttachmentsPerEntry = 32;
 export const maxAttachmentBytesPerEntry = 15 * 1_024 * 1_024;
 export const attachmentBudgetMessage =
@@ -76,9 +84,12 @@ export const createRaiseSchema = z
   });
 export type CreateRaiseInput = z.infer<typeof createRaiseSchema>;
 
+export const claimModeSchema = z.enum(["cookie", "token"]);
+export type ClaimMode = z.infer<typeof claimModeSchema>;
+
 export const claimSchema = z.object({
   token: z.string().min(20).max(400),
-  mode: z.enum(["cookie", "token"]).default("cookie"),
+  mode: claimModeSchema.default("cookie"),
   expectedRole: roleSchema.optional(),
   exchangeId: z
     .string()
@@ -126,6 +137,29 @@ export const postEntrySchema = z
   });
 export type PostEntryInput = z.infer<typeof postEntrySchema>;
 
+export const inboxQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+export type InboxQuery = z.infer<typeof inboxQuerySchema>;
+
+export const inboxItemSchema = z.object({
+  raiseId: z.string(),
+  title: z.string(),
+  origin: roleSchema,
+  waitingOn: roleSchema.nullable(),
+  pendingAction: pendingActionKindSchema.nullable(),
+  version: z.number().int().min(1),
+  createdAt: z.iso.datetime(),
+  updatedAt: z.iso.datetime(),
+  expiresAt: z.iso.datetime(),
+});
+export type InboxItem = z.infer<typeof inboxItemSchema>;
+
+export const inboxResponseSchema = z.object({
+  items: z.array(inboxItemSchema),
+});
+export type InboxResponse = z.infer<typeof inboxResponseSchema>;
+
 export interface AttachmentView {
   id: string;
   name: string;
@@ -145,9 +179,6 @@ export interface EntryView {
   createdAt: string;
   attachments: AttachmentView[];
 }
-
-export type PendingActionKind =
-  "provide_context" | "perform_work" | "review_result" | "make_changes";
 
 export interface RaiseView {
   id: string;

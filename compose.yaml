@@ -8,6 +8,7 @@ services:
       DATA_DIR: /data
       ANONYMOUS_TTL_HOURS: ${ANONYMOUS_TTL_HOURS:-24}
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-15728640}
+      RAISE_INBOX_TOKEN: ${RAISE_INBOX_TOKEN:-}
     volumes:
       - raise-data:/data
     restart: unless-stopped

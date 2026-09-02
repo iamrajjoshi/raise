@@ -40,16 +40,17 @@ describe("Raise MCP HTTP client", () => {
       ),
     );
     const client = new RaiseClient("http://localhost:8787", fetcher);
+    const exchangeId = "79f46eb8-2752-42fc-8a35-61ce9e91d562";
 
     await expect(
-      client.exchangeClaim("http://localhost:8787/r/r_1#token=cap_abc.secret"),
+      client.exchangeClaim("http://localhost:8787/r/r_1#token=cap_abc.secret", exchangeId),
     ).resolves.toMatchObject({ raiseId: "r_1", token: "ses_1.secret" });
     expect(fetcher).toHaveBeenCalledWith("http://localhost:8787/api/claims", expect.any(Object));
     expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toMatchObject({
       token: "cap_abc.secret",
       mode: "token",
       expectedRole: "agent",
-      exchangeId: expect.any(String),
+      exchangeId,
     });
   });
 
@@ -69,9 +70,10 @@ describe("Raise MCP HTTP client", () => {
         ),
       );
     const client = new RaiseClient("http://localhost:8787", fetcher);
+    const exchangeId = "13162363-fb99-441b-aeee-06a2295c1c58";
 
     await expect(
-      client.exchangeClaim("http://localhost:8787/r/r_1#token=cap_abc.secret"),
+      client.exchangeClaim("http://localhost:8787/r/r_1#token=cap_abc.secret", exchangeId),
     ).resolves.toMatchObject({ token: "ses_1.secret" });
     expect(fetcher).toHaveBeenCalledTimes(2);
     const first = JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body)) as { exchangeId: string };
@@ -79,25 +81,52 @@ describe("Raise MCP HTTP client", () => {
       exchangeId: string;
     };
     expect(second.exchangeId).toBe(first.exchangeId);
+    expect(first.exchangeId).toBe(exchangeId);
+  });
 
-    const restartedFetcher = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          raiseId: "r_1",
-          role: "agent",
-          token: "ses_1.secret",
-          expiresAt: "2026-09-01T00:00:00.000Z",
+  it("lists and opens inbox items with the local inbox credential", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
         }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
-    );
-    await new RaiseClient("http://localhost:8787", restartedFetcher).exchangeClaim(
-      "http://localhost:8787/r/r_1#token=cap_abc.secret",
-    );
-    const afterRestart = JSON.parse(String(restartedFetcher.mock.calls[0]?.[1]?.body)) as {
-      exchangeId: string;
-    };
-    expect(afterRestart.exchangeId).toBe(first.exchangeId);
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            raiseId: "r_1",
+            role: "agent",
+            token: "ses_1.secret",
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    const client = new RaiseClient("http://localhost:8787", fetcher);
+
+    await expect(client.listInbox("inbox_local.secret", 25)).resolves.toEqual({
+      items: [],
+    });
+    await expect(client.openInbox("r_1", "inbox_local.secret")).resolves.toMatchObject({
+      raiseId: "r_1",
+      role: "agent",
+    });
+
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      "http://localhost:8787/api/inbox?limit=25",
+      "http://localhost:8787/api/inbox/r_1/session",
+    ]);
+    for (const [, init] of fetcher.mock.calls) {
+      const headers = new Headers(init?.headers);
+      expect(headers.get("authorization")).toBe("Bearer inbox_local.secret");
+    }
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("content-type")).toBeNull();
+    expect(new Headers(fetcher.mock.calls[1]?.[1]?.headers).get("content-type")).toBeNull();
+    expect(
+      fetcher.mock.calls.map(([url, init]) => `${String(url)} ${String(init?.body)}`).join("\n"),
+    ).not.toContain("inbox_local.secret");
   });
 
   it("returns concrete API errors to the agent", async () => {

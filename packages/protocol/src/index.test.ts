@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   createRaiseSchema,
   dataUrlByteLength,
+  inboxQuerySchema,
+  inboxResponseSchema,
   maxAttachmentBytesPerEntry,
   maxAttachmentsPerEntry,
   postEntrySchema,
@@ -58,5 +60,37 @@ describe("attachment input limits", () => {
         attachments: Array.from({ length: maxAttachmentsPerEntry + 1 }, () => tinyAttachment),
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("inbox protocol", () => {
+  it("defaults and validates the inbox page size", () => {
+    expect(inboxQuerySchema.parse({})).toEqual({ limit: 50 });
+    expect(inboxQuerySchema.parse({ limit: "100" })).toEqual({ limit: 100 });
+    expect(inboxQuerySchema.safeParse({ limit: "0" }).success).toBe(false);
+    expect(inboxQuerySchema.safeParse({ limit: "101" }).success).toBe(false);
+    expect(inboxQuerySchema.safeParse({ limit: "1.5" }).success).toBe(false);
+    expect(inboxQuerySchema.safeParse({ limit: "many" }).success).toBe(false);
+  });
+
+  it("validates compact inbox responses", () => {
+    const timestamp = "2026-09-02T12:00:00.000Z";
+    expect(
+      inboxResponseSchema.parse({
+        items: [
+          {
+            raiseId: "r_example",
+            title: "Fix the clipped panel",
+            origin: "human",
+            waitingOn: "agent",
+            pendingAction: "perform_work",
+            version: 1,
+            createdAt: timestamp,
+            updatedAt: timestamp,
+            expiresAt: timestamp,
+          },
+        ],
+      }),
+    ).toMatchObject({ items: [{ raiseId: "r_example", waitingOn: "agent" }] });
   });
 });

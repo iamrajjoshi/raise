@@ -2,21 +2,56 @@ import { setTimeout as delay } from "node:timers/promises";
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import type { PostEntryInput, RaiseView } from "@raise/protocol";
 import * as z from "zod/v4";
-import { RaiseClient, type StoredSession } from "./client.js";
+import { claimTokenFromUrl, RaiseApiError, RaiseClient, type StoredSession } from "./client.js";
 import { attachmentsFromPaths } from "./attachments.js";
-import { SessionStore } from "./store.js";
+import {
+  pendingOpenDigest,
+  PendingExchangeStore,
+  PendingOpenStore,
+  SessionStore,
+} from "./store.js";
 
 function result(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
 
-function failure(error: unknown) {
+function failure(error: unknown, secrets: string[] = []) {
+  let message = error instanceof Error ? error.message : String(error);
+  for (const secret of secrets) {
+    if (secret) message = message.replaceAll(secret, "[redacted]");
+  }
   return {
-    content: [
-      { type: "text" as const, text: error instanceof Error ? error.message : String(error) },
-    ],
+    content: [{ type: "text" as const, text: message }],
     isError: true,
   };
+}
+
+function isTerminalClaimError(error: unknown) {
+  return (
+    error instanceof RaiseApiError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429
+  );
+}
+
+async function clearTerminalClaimState(error: unknown, clearers: Array<() => Promise<void>>) {
+  if (!isTerminalClaimError(error)) return;
+  const results = await Promise.allSettled(clearers.map((clear) => clear()));
+  if (results.some((item) => item.status === "rejected")) {
+    throw new Error(
+      `${error instanceof Error ? error.message : String(error)} Local pending retry state could not be cleared.`,
+      { cause: error },
+    );
+  }
+}
+
+async function clearSavedClaimState(clearers: Array<() => Promise<void>>) {
+  const results = await Promise.allSettled(clearers.map((clear) => clear()));
+  return results.some((item) => item.status === "rejected")
+    ? "The scoped session was saved, but local pending retry state could not be cleared."
+    : undefined;
 }
 
 function publicView(view: RaiseView) {
@@ -98,24 +133,34 @@ function ownerSession(
   },
 ) {
   if (!claim.token) throw new Error("Raise did not return an agent session token.");
+  if (claim.role !== "agent") throw new Error("Raise did not return an agent-scoped session.");
   return {
     server: new URL(server).origin,
     raiseId: claim.raiseId,
-    role: claim.role,
+    role: "agent",
     token: claim.token,
     expiresAt: claim.expiresAt ?? "9999-12-31T23:59:59.999Z",
   } satisfies StoredSession;
 }
 
-export function buildServer(options?: { client?: RaiseClient; store?: SessionStore }) {
+export function buildServer(options?: {
+  client?: RaiseClient;
+  store?: SessionStore;
+  pendingExchanges?: PendingExchangeStore;
+  pendingOpens?: PendingOpenStore;
+  inboxToken?: string;
+}) {
   const client =
     options?.client ?? new RaiseClient(process.env.RAISE_BASE_URL ?? "http://localhost:8787");
   const store = options?.store ?? new SessionStore();
+  const pendingExchanges = options?.pendingExchanges ?? new PendingExchangeStore(store.directory);
+  const pendingOpens = options?.pendingOpens ?? new PendingOpenStore(store.directory);
+  const inboxToken = options?.inboxToken ?? process.env.RAISE_INBOX_TOKEN;
   const server = new McpServer(
-    { name: "raise", version: "0.2.0-alpha.1" },
+    { name: "raise", version: "0.2.0-alpha.2" },
     {
       instructions:
-        "Use raise_open when you need a person to answer, inspect, or review something. Give them the returned humanUrl. Use raise_claim when a person pastes you an agent link. Read before replying, use raise_screenshot for any image omitted from the inline preview budget, and use raise_wait only for a bounded wait.",
+        "Use raise_inbox to discover work from a fresh agent session. Use raise_open when you need a person to answer, inspect, or review something, and give them the returned humanUrl. Use raise_claim when a person pastes you an agent link. Read before replying, use raise_screenshot for any image omitted from the inline preview budget, and use raise_wait only for a bounded wait.",
     },
   );
 
@@ -142,30 +187,64 @@ export function buildServer(options?: { client?: RaiseClient; store?: SessionSto
         }),
     },
     async ({ prompt, title, url, screenshotPaths, expiresInHours }) => {
+      let ownerClaimToken: string | undefined;
       try {
         await store.assertWritable();
-        const attachments = await attachmentsFromPaths(screenshotPaths);
-        const created = await client.create({
-          origin: "agent",
+        const inputDigest = pendingOpenDigest({
           prompt,
-          attachments,
+          screenshotPaths,
           expiresInHours,
           ...(title ? { title } : {}),
           ...(url ? { url } : {}),
         });
-        const claim = await client.exchangeClaim(created.ownerClaimUrl);
+        let created = await pendingOpens.get(inputDigest);
+        if (!created) {
+          const attachments = await attachmentsFromPaths(screenshotPaths);
+          created = await pendingOpens.put(
+            inputDigest,
+            await client.create({
+              origin: "agent",
+              prompt,
+              attachments,
+              expiresInHours,
+              ...(title ? { title } : {}),
+              ...(url ? { url } : {}),
+            }),
+          );
+        }
+        const pendingClaimToken = claimTokenFromUrl(created.ownerClaimUrl, client.baseUrl);
+        ownerClaimToken = pendingClaimToken;
+        const exchangeId = await pendingExchanges.getOrCreate(client.baseUrl, pendingClaimToken);
+        let claim;
+        try {
+          claim = await client.exchangeClaim(created.ownerClaimUrl, exchangeId);
+        } catch (error) {
+          await clearTerminalClaimState(error, [
+            () => pendingOpens.clear(inputDigest),
+            () => pendingExchanges.clear(client.baseUrl, pendingClaimToken),
+          ]);
+          throw error;
+        }
+        if (claim.raiseId !== created.raiseId) {
+          throw new Error("Raise returned a session for a different request.");
+        }
         const session = ownerSession(client.baseUrl, claim);
-        let persisted = await store.put(session);
         let expiryUnverified = false;
         if (!claim.expiresAt) {
           try {
             const view = await client.read(session);
             session.expiresAt = view.expiresAt;
-            persisted = await store.put(session);
           } catch {
             expiryUnverified = true;
           }
         }
+        const persisted = await store.put(session);
+        const cleanupWarning = persisted
+          ? await clearSavedClaimState([
+              () => pendingOpens.clear(inputDigest),
+              () => pendingExchanges.clear(client.baseUrl, pendingClaimToken),
+            ])
+          : undefined;
         const warnings = [
           ...(!persisted
             ? ["Keep this MCP process running; its session could not be saved to disk."]
@@ -175,6 +254,7 @@ export function buildServer(options?: { client?: RaiseClient; store?: SessionSto
                 "The older Raise server did not provide a session expiry, so it could not be verified.",
               ]
             : []),
+          ...(cleanupWarning ? [cleanupWarning] : []),
         ];
         return result({
           raiseId: created.raiseId,
@@ -186,7 +266,7 @@ export function buildServer(options?: { client?: RaiseClient; store?: SessionSto
           ...(warnings.length ? { warning: warnings.join(" ") } : {}),
         });
       } catch (error) {
-        return failure(error);
+        return failure(error, ownerClaimToken ? [ownerClaimToken] : []);
       }
     },
   );
@@ -202,14 +282,75 @@ export function buildServer(options?: { client?: RaiseClient; store?: SessionSto
       }),
     },
     async ({ claimUrl, includeImages }) => {
+      let claimToken: string | undefined;
       try {
         await store.assertWritable();
-        const claim = await client.exchangeClaim(claimUrl);
+        const pendingClaimToken = claimTokenFromUrl(claimUrl, client.baseUrl);
+        claimToken = pendingClaimToken;
+        const exchangeId = await pendingExchanges.getOrCreate(client.baseUrl, pendingClaimToken);
+        let claim;
+        try {
+          claim = await client.exchangeClaim(claimUrl, exchangeId);
+        } catch (error) {
+          await clearTerminalClaimState(error, [
+            () => pendingExchanges.clear(client.baseUrl, pendingClaimToken),
+          ]);
+          throw error;
+        }
         const session = ownerSession(client.baseUrl, claim);
-        await store.put(session);
         const view = await client.read(session);
         session.expiresAt = view.expiresAt;
         const persisted = await store.put(session);
+        const cleanupWarning = persisted
+          ? await clearSavedClaimState([
+              () => pendingExchanges.clear(client.baseUrl, pendingClaimToken),
+            ])
+          : undefined;
+        return await viewResult(client, session, view, includeImages, {
+          sessionStorage: persisted ? "saved" : "memory_only",
+          ...(!persisted
+            ? { warning: "Keep this MCP process running; its session could not be saved to disk." }
+            : cleanupWarning
+              ? { warning: cleanupWarning }
+              : {}),
+        });
+      } catch (error) {
+        return failure(error, claimToken ? [claimToken] : []);
+      }
+    },
+  );
+
+  server.registerTool(
+    "raise_inbox",
+    {
+      title: "List or open the Raise inbox",
+      description:
+        "List work available to this agent, or open one item and save its scoped session locally.",
+      inputSchema: z.object({
+        raiseId: z.string().trim().min(1).optional(),
+        limit: z.number().int().min(1).max(100).default(50),
+        includeImages: z.boolean().default(true),
+      }),
+    },
+    async ({ raiseId, limit, includeImages }) => {
+      try {
+        if (!inboxToken?.trim()) {
+          throw new Error("RAISE_INBOX_TOKEN is required to list or open the agent inbox.");
+        }
+        if (!raiseId) return result(await client.listInbox(inboxToken, limit));
+
+        await store.assertWritable();
+        const claim = await client.openInbox(raiseId, inboxToken);
+        if (claim.raiseId !== raiseId) {
+          throw new Error("Raise returned a session for a different inbox item.");
+        }
+        const session = ownerSession(client.baseUrl, claim);
+        let persisted = await store.put(session);
+        const view = await client.read(session);
+        if (session.expiresAt !== view.expiresAt) {
+          session.expiresAt = view.expiresAt;
+          persisted = (await store.put(session)) || persisted;
+        }
         return await viewResult(client, session, view, includeImages, {
           sessionStorage: persisted ? "saved" : "memory_only",
           ...(!persisted
@@ -217,7 +358,7 @@ export function buildServer(options?: { client?: RaiseClient; store?: SessionSto
             : {}),
         });
       } catch (error) {
-        return failure(error);
+        return failure(error, inboxToken ? [inboxToken] : []);
       }
     },
   );

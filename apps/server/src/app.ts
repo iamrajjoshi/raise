@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ import {
   attachmentBudgetMessage,
   claimSchema,
   createRaiseSchema,
+  inboxQuerySchema,
   postEntrySchema,
   type ApiError,
 } from "@raise/protocol";
@@ -21,12 +23,26 @@ export interface AppOptions {
   publicBaseUrl: string;
   logger?: boolean;
   bodyLimit?: number;
+  inboxToken?: string;
 }
 
 function bearerToken(request: FastifyRequest, raiseId: string): string | undefined {
   const authorization = request.headers.authorization;
   if (authorization?.startsWith("Bearer ")) return authorization.slice(7);
   return request.cookies[`raise_session_${raiseId}`];
+}
+
+function authorizationBearer(request: FastifyRequest): string | undefined {
+  const match = /^Bearer ([^\s]+)$/i.exec(request.headers.authorization ?? "");
+  return match?.[1];
+}
+
+function secretDigest(value: string): Buffer {
+  return createHash("sha256").update(value).digest();
+}
+
+function secretMatches(value: string, expectedDigest: Buffer): boolean {
+  return timingSafeEqual(secretDigest(value), expectedDigest);
 }
 
 function zodIssues(error: unknown): unknown[] | null {
@@ -52,9 +68,30 @@ function isBodyTooLarge(error: unknown): boolean {
 }
 
 export async function createApp(options: AppOptions) {
+  if (options.inboxToken !== undefined && options.inboxToken.length < 32) {
+    throw new Error("RAISE_INBOX_TOKEN must be at least 32 characters when set.");
+  }
+  const inboxTokenDigest = options.inboxToken ? secretDigest(options.inboxToken) : undefined;
   await mkdir(options.dataDir, { recursive: true });
   const app = Fastify({
-    logger: options.logger ?? false,
+    logger: options.logger
+      ? {
+          redact: {
+            paths: [
+              "req.headers.authorization",
+              "request.headers.authorization",
+              "headers.authorization",
+              "body.token",
+              "body.exchangeId",
+              "req.body.token",
+              "req.body.exchangeId",
+              "request.body.token",
+              "request.body.exchangeId",
+            ],
+            censor: "[REDACTED]",
+          },
+        }
+      : false,
     bodyLimit: options.bodyLimit ?? 24_000_000,
   });
   const db = new RaiseDatabase(options.databasePath);
@@ -114,6 +151,31 @@ export async function createApp(options: AppOptions) {
   app.get("/healthz", async () => ({ status: "ok" }));
   app.get("/readyz", async () => ({ status: "ready" }));
 
+  function authenticateInbox(request: FastifyRequest) {
+    if (!inboxTokenDigest) {
+      throw new HttpError(
+        503,
+        "inbox_disabled",
+        "The agent inbox is not configured on this server.",
+      );
+    }
+    const token = authorizationBearer(request);
+    if (!token || !secretMatches(token, inboxTokenDigest)) {
+      throw new HttpError(401, "unauthorized", "Agent inbox authentication failed.");
+    }
+  }
+
+  app.get<{ Querystring: Record<string, unknown> }>("/api/inbox", async (request) => {
+    authenticateInbox(request);
+    const query = inboxQuerySchema.parse(request.query);
+    return db.getInbox(query.limit);
+  });
+
+  app.post<{ Params: { raiseId: string } }>("/api/inbox/:raiseId/session", async (request) => {
+    authenticateInbox(request);
+    return db.createInboxSession(request.params.raiseId);
+  });
+
   app.post("/api/raises", async (request, reply) => {
     const input = createRaiseSchema.parse(request.body);
     const images = await prepareImages(input.attachments);
@@ -131,7 +193,7 @@ export async function createApp(options: AppOptions) {
 
   app.post("/api/claims", async (request, reply) => {
     const input = claimSchema.parse(request.body);
-    const claimed = db.exchangeClaim(input.token, input.expectedRole, input.exchangeId);
+    const claimed = db.exchangeClaim(input.token, input.mode, input.expectedRole, input.exchangeId);
     if (input.mode === "cookie") {
       const secure = options.publicBaseUrl.startsWith("https://");
       reply.setCookie(`raise_session_${claimed.raiseId}`, claimed.sessionToken, {

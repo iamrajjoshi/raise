@@ -7,8 +7,15 @@ const localDataDir = fileURLToPath(new URL("../../../data", import.meta.url));
 const dataDir = resolve(process.env.DATA_DIR ?? localDataDir);
 const databasePath = resolve(dataDir, "raise.db");
 const publicBaseUrl = process.env.PUBLIC_BASE_URL ?? `http://localhost:${port}`;
+const inboxToken = process.env.RAISE_INBOX_TOKEN || undefined;
 
-const app = await createApp({ databasePath, dataDir, publicBaseUrl, logger: true });
+const app = await createApp({
+  databasePath,
+  dataDir,
+  publicBaseUrl,
+  logger: true,
+  ...(inboxToken ? { inboxToken } : {}),
+});
 
 const stop = async () => {
   await app.close();

@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
 import type {
   ClaimResponse,
   CreateRaiseInput,
   CreateRaiseResponse,
+  InboxResponse,
   PostEntryInput,
   RaiseView,
 } from "@raise/protocol";
@@ -62,9 +62,13 @@ export class RaiseClient {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const headers = new Headers(init?.headers);
+    if (init?.body !== undefined && !headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
     const response = await this.fetcher(`${this.baseUrl}${path}`, {
       ...init,
-      headers: { "content-type": "application/json", ...init?.headers },
+      headers,
       signal: init?.signal ?? AbortSignal.timeout(20_000),
     });
     if (!response.ok) {
@@ -88,12 +92,8 @@ export class RaiseClient {
     });
   }
 
-  async exchangeClaim(claimUrl: string) {
+  async exchangeClaim(claimUrl: string, exchangeId: string) {
     const token = claimTokenFromUrl(claimUrl, this.baseUrl);
-    const exchangeId = createHash("sha256")
-      .update("raise-claim-exchange-v1\0")
-      .update(token)
-      .digest("base64url");
     const exchange = () =>
       this.request<ClaimResponse>("/api/claims", {
         method: "POST",
@@ -103,9 +103,29 @@ export class RaiseClient {
     try {
       return await exchange();
     } catch (error) {
-      if (error instanceof RaiseApiError && error.status < 500) throw error;
+      if (
+        error instanceof RaiseApiError &&
+        error.status !== 408 &&
+        error.status !== 429 &&
+        error.status < 500
+      ) {
+        throw error;
+      }
       return exchange();
     }
+  }
+
+  listInbox(inboxToken: string, limit: number) {
+    return this.request<InboxResponse>(`/api/inbox?limit=${limit}`, {
+      headers: { authorization: `Bearer ${inboxToken}` },
+    });
+  }
+
+  openInbox(raiseId: string, inboxToken: string) {
+    return this.request<ClaimResponse>(`/api/inbox/${encodeURIComponent(raiseId)}/session`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${inboxToken}` },
+    });
   }
 
   read(session: StoredSession, signal?: AbortSignal) {

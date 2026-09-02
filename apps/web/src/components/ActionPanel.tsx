@@ -181,7 +181,7 @@ export function ActionPanel({ raise, busy, error, onSubmit }: ActionPanelProps) 
       <span className="waiting-pulse" aria-hidden="true" />
       <div>
         <strong>{raise.waitingOn === "agent" ? "Agent’s turn" : "Human’s turn"}</strong>
-        <p>Leave this page open. The reply will appear here.</p>
+        <p>You can close this tab. Check Inbox later for the reply.</p>
       </div>
     </section>
   );

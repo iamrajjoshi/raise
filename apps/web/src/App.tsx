@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from
 import type { AttachmentInput, PostEntryInput, RaiseView } from "@raise/protocol";
 import { ActionPanel } from "./components/ActionPanel";
 import { Brand } from "./components/Brand";
+import { Inbox } from "./components/Inbox";
 import { Scratchpad } from "./components/Scratchpad";
 import { ShareCard } from "./components/ShareCard";
 import { Timeline } from "./components/Timeline";
@@ -13,6 +14,7 @@ import {
   postEntry,
   RequestError,
 } from "./lib/api";
+import { groupInboxRaises, loadRememberedRaises, rememberRaise } from "./lib/localInbox";
 
 function formatDateTime(value: string) {
   return new Intl.DateTimeFormat(undefined, {
@@ -26,9 +28,11 @@ function formatDateTime(value: string) {
 
 function SiteHeader({
   showNewRequest = false,
+  showInbox = true,
   currentLabel,
 }: {
   showNewRequest?: boolean;
+  showInbox?: boolean;
   currentLabel?: string;
 }) {
   return (
@@ -37,13 +41,19 @@ function SiteHeader({
         <Brand />
       </div>
       <div className="header-title-cell">
-        {currentLabel ? (
-          <h1 className="header-context">{currentLabel}</h1>
-        ) : showNewRequest ? (
-          <a className="control control-quiet header-link" href="/">
-            New request
-          </a>
-        ) : null}
+        {currentLabel && <h1 className="header-context">{currentLabel}</h1>}
+        <nav className="header-actions" aria-label="Raise pages">
+          {showInbox && (
+            <a className="control control-quiet header-link" href="/inbox">
+              Inbox
+            </a>
+          )}
+          {showNewRequest && (
+            <a className="control control-quiet header-link" href="/">
+              New request
+            </a>
+          )}
+        </nav>
       </div>
     </header>
   );
@@ -53,17 +63,23 @@ function AppFrame({
   children,
   currentLabel,
   showNewRequest = false,
+  showInbox = true,
   className = "",
 }: {
   children: ReactNode;
   currentLabel?: string;
   showNewRequest?: boolean;
+  showInbox?: boolean;
   className?: string;
 }) {
   return (
     <div className={`app-shell ${className}`}>
       <div className="work-sheet">
-        <SiteHeader showNewRequest={showNewRequest} {...(currentLabel ? { currentLabel } : {})} />
+        <SiteHeader
+          showNewRequest={showNewRequest}
+          showInbox={showInbox}
+          {...(currentLabel ? { currentLabel } : {})}
+        />
         {children}
       </div>
     </div>
@@ -89,6 +105,7 @@ function NewRaisePage() {
       });
       const ownerToken = new URL(result.ownerClaimUrl).hash.slice("#token=".length);
       await claimRaise(ownerToken);
+      rememberRaise(result.raiseId);
       sessionStorage.setItem(`raise.share.${result.raiseId}`, result.targetClaimUrl);
       window.location.assign(`/r/${result.raiseId}`);
     } catch (caught) {
@@ -135,6 +152,7 @@ function RaisePage({ raiseId }: { raiseId: string }) {
   const load = useCallback(async () => {
     const view = await getRaise(raiseId);
     setRaise(view);
+    rememberRaise(view.id);
     return view;
   }, [raiseId]);
 
@@ -288,6 +306,34 @@ function RaisePage({ raiseId }: { raiseId: string }) {
   );
 }
 
+function InboxPage() {
+  const [groups, setGroups] = useState(() => groupInboxRaises([]));
+  const [failed, setFailed] = useState(0);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    void loadRememberedRaises(getRaise)
+      .then((result) => {
+        if (!active) return;
+        setGroups(groupInboxRaises(result.raises));
+        setFailed(result.failed);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  return (
+    <AppFrame className="app-shell-inbox" currentLabel="Inbox" showInbox={false} showNewRequest>
+      <Inbox groups={groups} loading={loading} failed={failed} />
+    </AppFrame>
+  );
+}
+
 function NotFoundPage() {
   return (
     <AppFrame className="app-shell-record" showNewRequest>
@@ -305,6 +351,7 @@ function NotFoundPage() {
 export function App() {
   const match = /^\/r\/([^/]+)$/.exec(window.location.pathname);
   if (match) return <RaisePage raiseId={match[1] as string} />;
+  if (window.location.pathname === "/inbox") return <InboxPage />;
   if (window.location.pathname === "/" || window.location.pathname === "/new")
     return <NewRaisePage />;
   return <NotFoundPage />;

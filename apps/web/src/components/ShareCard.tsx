@@ -33,8 +33,12 @@ export function ShareCard({ url, target }: { url: string; target: "agent" | "hum
   return (
     <aside className="share-card">
       <div className="share-copy">
-        <strong>{target === "agent" ? "Send to the agent" : "Send to the human"}</strong>
-        <p>Copy this before you close the tab. Raise won’t show it again.</p>
+        <strong>{target === "agent" ? "Agent link" : "Human link"}</strong>
+        <p>
+          {target === "agent"
+            ? "Connected agents will see this in their inbox. Otherwise, send this one-time link."
+            : "Send this one-time link before you close the tab. Raise won’t show it again."}
+        </p>
         <code>{url}</code>
       </div>
       <button type="button" className="control control-secondary copy-button" onClick={copy}>

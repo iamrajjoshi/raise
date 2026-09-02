@@ -16,7 +16,11 @@ The React app is compiled to static files and served by the Fastify process. SQL
 
 ## Trust model
 
-There are no accounts in v0.1. A one-time claim URL grants one role on one request. Claiming it creates an expiring session credential. An exact retry may replay that session with the same claim-scoped exchange ID, while a different exchange remains rejected. Only a SHA-256 digest of each secret is stored.
+There are no accounts in this alpha. A one-time claim URL grants one role on one request. Claiming it creates an expiring session credential. An exact retry may replay that session only with the same cryptographically random, client-held exchange secret and the same delivery mode. The exchange secret is generated independently from the claim URL, and the server stores only its SHA-256 digest. A different exchange or a switch between cookie and token delivery remains rejected.
+
+The migration to mode-bound replay deletes every pre-mode claim-exchange row instead of guessing whether it used cookie or token delivery. That one-time purge enables SQLite secure deletion and must complete a truncating WAL checkpoint before startup continues, removing the old plaintext from both the database pages and write-ahead log. It does not delete the consumed claim or its existing session capability, so clients that received the session remain connected while the ambiguous claim itself becomes non-replayable.
+
+The optional `RAISE_INBOX_TOKEN` is an instance-wide service credential for the implicit default project. It is configured through the environment, must contain at least 32 characters, and is never persisted or logged. It can list non-expired open Raises and mint only agent-role sessions for a selected request. Those minted credentials use the existing request-scoped capability checks. Browser cookies and request sessions do not authenticate the inbox.
 
 - Human and agent capabilities are separate.
 - Only the role targeted by the pending action can answer it.
@@ -41,7 +45,7 @@ Each mutation checks the client's expected request version. A stale client gets 
 
 ## Current shortcuts
 
-This alpha has a narrow idempotency key for retrying one-time claim exchange, but not yet for general mutations. It also does not yet have server-sent events, backup commands, account identity, or formal database/blob port interfaces. Image file writes and their metadata row are not one atomic operation yet. These are explicit v0.1 completion items, not hidden production claims.
+This alpha has a narrow retry secret for one-time claim exchange, but not yet idempotency for general mutations. The inbox intentionally models one implicit default project with one operator-provisioned agent token; it does not introduce accounts, memberships, assignments, unread state, or multi-project isolation. The service also does not yet have server-sent events, backup commands, account identity, or formal database/blob port interfaces. Image file writes and their metadata row are not one atomic operation yet. These are explicit completion items, not hidden production claims.
 
 The browser polls while a request is open. The stdio MCP adapter uses the same client-neutral HTTP records and stores only its scoped agent sessions. It is not part of the core server and needs no database, blob-store, or Redis access.
 

@@ -2,18 +2,20 @@
 
 Raise is a self-hosted context and review channel for people and coding agents.
 
-A person or agent creates a request and shares a role-specific link. The thread keeps text, page URLs, screenshots, agent results, and review decisions together. Requests expire after 24 hours by default.
+A person or agent creates a request. Connected agents can find open work in the inbox; role-specific links handle human handoffs and work as the fallback. The thread keeps text, page URLs, screenshots, agent results, and review decisions together. Requests expire after 24 hours by default.
 
 The current alpha supports the first working loop:
 
 - Start a request from one scratchpad in the web app, or from the API.
 - Paste text from a document, paste a screenshot, or drop a plain-text or Markdown file.
+- Reopen requests from the device-local human inbox.
 - Share a role-scoped secret link.
 - Reply with text, links, or screenshots.
 - Post an agent result.
 - Accept the result or ask for changes.
 - Store everything in SQLite and a local data directory.
 - Use the same loop from an MCP-compatible coding agent.
+- Let a newly started agent find open work through an optional server inbox token.
 
 ## Run locally
 
@@ -37,7 +39,9 @@ Open `http://localhost:8787`.
 
 ## Agent access
 
-Build the repo, configure your MCP client to run `apps/mcp/dist/main.js`, and point `RAISE_BASE_URL` at the local or hosted Raise server. The agent can open a request for a human, claim a full URL pasted by a human, reply, and wait for the next turn. See [MCP adapter](docs/mcp.md) or the lower-level [HTTP protocol](docs/http-api.md).
+Build the repo, configure your MCP client to run `apps/mcp/dist/main.js`, and point `RAISE_BASE_URL` at the local or hosted Raise server. The agent can open a request for a human, claim a full URL pasted by a human, reply, and wait for the next turn.
+
+To let a fresh agent process discover open requests without a per-request link, set the same optional `RAISE_INBOX_TOKEN` on the server and adapter. Generate a random value of at least 32 characters; leaving it unset disables inbox access. This alpha uses one implicit default project and keeps the one-container deployment. See [MCP adapter](docs/mcp.md) or the lower-level [HTTP protocol](docs/http-api.md).
 
 ## Project status
 
