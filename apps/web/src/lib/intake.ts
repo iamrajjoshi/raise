@@ -2,15 +2,17 @@ import {
   attachmentBudgetMessage,
   dataUrlByteLength,
   maxAttachmentBytesPerEntry,
+  maxContentCharacters,
+  supportedAttachmentMimeTypes,
   type AttachmentInput,
 } from "@raise/protocol";
 
-export const maxBodyLength = 20_000;
+export const maxBodyLength = maxContentCharacters;
 export const screenshotBudgetMessage = attachmentBudgetMessage;
 
 const maxTextFilesPerImport = 4;
 const maxTextImportBytes = 16 * 1_024;
-const imageTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+const imageTypes = new Set<string>(supportedAttachmentMimeTypes);
 
 export interface ClassifiedFiles {
   screenshots: File[];

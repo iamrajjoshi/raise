@@ -1,10 +1,6 @@
-import { randomBytes } from "node:crypto";
-import { mkdir, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
 import { maxAttachmentBytesPerEntry, type AttachmentInput } from "@raise/protocol";
 import sharp from "sharp";
 import { HttpError } from "./errors.js";
-import type { RaiseDatabase } from "./database.js";
 
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES ?? 15_728_640);
 
@@ -15,8 +11,28 @@ export interface PreparedImage {
   height: number;
 }
 
-export function renderAgentPreview(storageKey: string) {
-  return sharp(storageKey)
+function detectedMimeType(source: Buffer): AttachmentInput["mimeType"] | undefined {
+  if (
+    source.length >= 8 &&
+    source.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return "image/png";
+  }
+  if (source.length >= 3 && source[0] === 0xff && source[1] === 0xd8 && source[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    source.length >= 12 &&
+    source.subarray(0, 4).toString("ascii") === "RIFF" &&
+    source.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return undefined;
+}
+
+export function renderAgentPreview(source: Buffer) {
+  return sharp(source)
     .resize({ width: 1_600, height: 1_600, fit: "inside", withoutEnlargement: true })
     .webp({ quality: 80 })
     .toBuffer();
@@ -30,10 +46,12 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
     const match = /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\r\n]+)$/.exec(
       image.dataUrl,
     );
-    if (!match || match[1] !== image.mimeType) {
+    const declaredMimeType = match?.[1];
+    const encodedSource = match?.[2];
+    if (declaredMimeType !== image.mimeType || encodedSource === undefined) {
       throw new HttpError(400, "invalid_image", `${image.name} isn’t a PNG, JPEG, or WebP image.`);
     }
-    const source = Buffer.from(match[2] as string, "base64");
+    const source = Buffer.from(encodedSource, "base64");
     if (!source.length || source.length > MAX_IMAGE_BYTES) {
       const maxMegabytes = Math.floor(MAX_IMAGE_BYTES / 1_048_576);
       throw new HttpError(
@@ -41,6 +59,9 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
         "image_too_large",
         `${image.name} is over ${maxMegabytes} MB. Try a smaller copy.`,
       );
+    }
+    if (detectedMimeType(source) !== image.mimeType) {
+      throw new HttpError(400, "invalid_image", `${image.name} isn’t a PNG, JPEG, or WebP image.`);
     }
     totalSourceBytes += source.length;
     if (totalSourceBytes > maxAttachmentBytesPerEntry) {
@@ -73,37 +94,4 @@ export async function prepareImages(images: AttachmentInput[]): Promise<Prepared
   }
 
   return prepared;
-}
-
-export async function storeImages(options: {
-  db: RaiseDatabase;
-  dataDir: string;
-  raiseId: string;
-  entryId: string;
-  images: PreparedImage[];
-}) {
-  if (!options.images.length) return;
-  const blobDir = join(options.dataDir, "blobs");
-  await mkdir(blobDir, { recursive: true });
-
-  for (const image of options.images) {
-    const attachmentId = `img_${randomBytes(9).toString("base64url")}`;
-    const storageKey = join(blobDir, `${attachmentId}.webp`);
-    await writeFile(storageKey, image.data, { flag: "wx" });
-    try {
-      options.db.addAttachment({
-        id: attachmentId,
-        entryId: options.entryId,
-        raiseId: options.raiseId,
-        displayName: image.displayName,
-        storageKey,
-        size: image.data.length,
-        width: image.width,
-        height: image.height,
-      });
-    } catch (error) {
-      await unlink(storageKey).catch(() => undefined);
-      throw error;
-    }
-  }
 }

@@ -1,13 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import Database from "better-sqlite3";
 import type { FastifyInstance } from "fastify";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { ClaimResponse, CreateRaiseResponse, RaiseView } from "@raise/protocol";
-import { createApp } from "../src/app.js";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { ClaimResponse, CreateRaiseResponse, RaiseView, Role } from "@raise/protocol";
+import { valkeyRaiseKeys } from "../src/valkey-store.js";
+import {
+  createValkeyTestApp,
+  createValkeyTestStore,
+  startValkeyTestServer,
+  type ValkeyTestServer,
+} from "./valkey-test-server.js";
 
 const onePixelPng =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
@@ -21,24 +25,20 @@ function replaySecret() {
   return randomBytes(32).toString("base64url");
 }
 
-async function expectDatabaseArtifactsNotToContain(databasePath: string, sentinel: Buffer) {
-  for (const artifact of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
-    if (existsSync(artifact)) {
-      expect((await readFile(artifact)).includes(sentinel), artifact).toBe(false);
-    }
-  }
-}
-
 describe("Raise closed loop", () => {
   let app: FastifyInstance;
   let dataDir: string;
-  let databasePath: string;
+  let server: ValkeyTestServer;
+  let testStore: Awaited<ReturnType<typeof createValkeyTestStore>>;
+
+  beforeAll(async () => {
+    server = await startValkeyTestServer();
+  });
 
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), "raise-test-"));
-    databasePath = join(dataDir, "raise.db");
-    app = await createApp({
-      databasePath,
+    testStore = await createValkeyTestStore(server.url, "closed-loop");
+    app = await createValkeyTestApp(testStore.store, {
       dataDir,
       publicBaseUrl: "http://raise.test",
     });
@@ -46,10 +46,13 @@ describe("Raise closed loop", () => {
 
   afterEach(async () => {
     await app.close();
+    await testStore.cleanup();
     await rm(dataDir, { recursive: true, force: true });
   });
 
-  async function create(origin: "human" | "agent", withImage = false) {
+  afterAll(async () => server?.stop());
+
+  async function create(origin: Role, withImage = false) {
     const response = await app.inject({
       method: "POST",
       url: "/api/raises",
@@ -64,7 +67,6 @@ describe("Raise closed loop", () => {
         attachments: withImage
           ? [{ name: "billing.png", mimeType: "image/png", dataUrl: onePixelPng }]
           : [],
-        expiresInHours: 24,
       },
     });
     expect(response.statusCode).toBe(201);
@@ -72,10 +74,11 @@ describe("Raise closed loop", () => {
   }
 
   async function exchange(url: string) {
+    const raiseId = new URL(url).pathname.split("/").at(-1) as string;
     const response = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token: claimToken(url), mode: "token" },
+      payload: { raiseId, token: claimToken(url), mode: "token" },
     });
     expect(response.statusCode).toBe(200);
     const claim = response.json<ClaimResponse>();
@@ -84,7 +87,10 @@ describe("Raise closed loop", () => {
   }
 
   function auth(token: string) {
-    return { authorization: `Bearer ${token}` };
+    return {
+      authorization: `Bearer ${token}`,
+      "idempotency-key": randomBytes(18).toString("base64url"),
+    };
   }
 
   it("completes a human-started result and acceptance", async () => {
@@ -146,6 +152,61 @@ describe("Raise closed loop", () => {
     });
   });
 
+  it("requires an idempotency key and replays the exact entry without duplicating it", async () => {
+    const created = await create("human");
+    const agentToken = await exchange(created.targetClaimUrl);
+    const payload = {
+      kind: "result",
+      body: "One committed result.",
+      attachments: [{ name: "result.png", mimeType: "image/png", dataUrl: onePixelPng }],
+      expectedVersion: 1,
+    };
+    const headers = {
+      authorization: `Bearer ${agentToken}`,
+      "idempotency-key": "http-exact-replay-0001",
+    };
+
+    const first = await app.inject({
+      method: "POST",
+      url: `/api/raises/${created.raiseId}/entries`,
+      headers,
+      payload,
+    });
+    expect(first.statusCode).toBe(201);
+    expect(first.json<RaiseView>()).toMatchObject({ version: 2 });
+
+    const replay = await app.inject({
+      method: "POST",
+      url: `/api/raises/${created.raiseId}/entries`,
+      headers,
+      payload,
+    });
+    expect(replay.statusCode).toBe(201);
+    expect(replay.json<RaiseView>()).toMatchObject({ version: 2 });
+    expect(replay.json<RaiseView>().entries).toHaveLength(2);
+    expect(replay.json<RaiseView>().entries[1]?.attachments).toHaveLength(1);
+
+    const conflict = await app.inject({
+      method: "POST",
+      url: `/api/raises/${created.raiseId}/entries`,
+      headers,
+      payload: { ...payload, body: "A different result." },
+    });
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json()).toMatchObject({ code: "idempotency_conflict" });
+
+    const missing = await create("human");
+    const missingToken = await exchange(missing.targetClaimUrl);
+    const withoutKey = await app.inject({
+      method: "POST",
+      url: `/api/raises/${missing.raiseId}/entries`,
+      headers: { authorization: `Bearer ${missingToken}` },
+      payload: { ...payload, attachments: [] },
+    });
+    expect(withoutKey.statusCode).toBe(400);
+    expect(withoutKey.json()).toMatchObject({ code: "invalid_request" });
+  });
+
   it("completes an agent-started context exchange and a changes cycle", async () => {
     const created = await create("agent");
     const agentToken = await exchange(created.ownerClaimUrl);
@@ -199,12 +260,28 @@ describe("Raise closed loop", () => {
   it("consumes a claim once and scopes sessions to one Raise", async () => {
     const first = await create("human");
     const second = await create("human");
+    const mismatchedRequest = await app.inject({
+      method: "POST",
+      url: "/api/claims",
+      payload: {
+        raiseId: second.raiseId,
+        token: claimToken(first.ownerClaimUrl),
+        mode: "token",
+      },
+    });
+    expect(mismatchedRequest.statusCode).toBe(401);
+    expect(mismatchedRequest.json()).toMatchObject({ code: "invalid_capability" });
+
     const firstToken = await exchange(first.ownerClaimUrl);
 
     const reused = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token: claimToken(first.ownerClaimUrl), mode: "token" },
+      payload: {
+        raiseId: first.raiseId,
+        token: claimToken(first.ownerClaimUrl),
+        mode: "token",
+      },
     });
     expect(reused.statusCode).toBe(401);
     expect(reused.json()).toMatchObject({ code: "invalid_capability" });
@@ -223,6 +300,7 @@ describe("Raise closed loop", () => {
       method: "POST",
       url: "/api/claims",
       payload: {
+        raiseId: created.raiseId,
         token: claimToken(created.targetClaimUrl),
         mode: "token",
         expectedRole: "human",
@@ -242,28 +320,48 @@ describe("Raise closed loop", () => {
     const first = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+      payload: {
+        raiseId: created.raiseId,
+        token,
+        mode: "token",
+        expectedRole: "agent",
+        exchangeId,
+      },
     });
     expect(first.statusCode).toBe(200);
 
-    const inspection = new Database(databasePath, { readonly: true });
-    const storedExchange = inspection
-      .prepare("SELECT exchange_id, exchange_id_hash, exchange_mode FROM claim_exchanges")
-      .get() as {
-      exchange_id: string;
-      exchange_id_hash: string;
-      exchange_mode: string;
+    const claimId = token.slice(0, token.indexOf(".")).slice("cap_".length);
+    const keys = valkeyRaiseKeys(created.raiseId, testStore.keyPrefix);
+    const rawClaim = await testStore.client.hGet(keys.capabilities, claimId);
+    const storedClaim = JSON.parse(rawClaim ?? "null") as {
+      contentKeyEnvelope: string;
+      exchangeDigest: string;
+      exchangeMode: string;
+      sessionCapabilityId: string;
     };
-    inspection.close();
-    expect(storedExchange).toEqual({
-      exchange_id: "",
-      exchange_id_hash: createHash("sha256").update(exchangeId).digest("hex"),
-      exchange_mode: "token",
+    expect(rawClaim).not.toContain(exchangeId);
+    expect(storedClaim).toMatchObject({
+      contentKeyEnvelope: "",
+      exchangeDigest: createHash("sha256")
+        .update("raise/claim-exchange/v1")
+        .update("\0")
+        .update(exchangeId)
+        .digest("hex"),
+      exchangeMode: "token",
+    });
+    const rawSession = await testStore.client.hGet(
+      keys.capabilities,
+      storedClaim.sessionCapabilityId,
+    );
+    expect(JSON.parse(rawSession ?? "null")).toMatchObject({
+      kind: "session",
+      contentKeyEnvelope: expect.stringMatching(/^wk1\./),
     });
 
     await app.close();
-    app = await createApp({
-      databasePath,
+    await testStore.client.close();
+    testStore = await createValkeyTestStore(server.url, "closed-loop-restart", testStore.keyPrefix);
+    app = await createValkeyTestApp(testStore.store, {
       dataDir,
       publicBaseUrl: "http://raise.test",
     });
@@ -271,17 +369,24 @@ describe("Raise closed loop", () => {
     const replay = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+      payload: {
+        raiseId: created.raiseId,
+        token,
+        mode: "token",
+        expectedRole: "agent",
+        exchangeId,
+      },
     });
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toEqual(first.json());
 
-    const [claimId] = token.split(".");
+    const [claimPrefix] = token.split(".");
     const forged = await app.inject({
       method: "POST",
       url: "/api/claims",
       payload: {
-        token: `${claimId}.${"A".repeat(43)}`,
+        raiseId: created.raiseId,
+        token: `${claimPrefix}.${"A".repeat(43)}`,
         mode: "token",
         expectedRole: "agent",
         exchangeId,
@@ -294,6 +399,7 @@ describe("Raise closed loop", () => {
       method: "POST",
       url: "/api/claims",
       payload: {
+        raiseId: created.raiseId,
         token,
         mode: "token",
         expectedRole: "agent",
@@ -311,7 +417,13 @@ describe("Raise closed loop", () => {
     const first = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token, mode: "cookie", expectedRole: "agent", exchangeId },
+      payload: {
+        raiseId: created.raiseId,
+        token,
+        mode: "cookie",
+        expectedRole: "agent",
+        exchangeId,
+      },
     });
     expect(first.statusCode).toBe(200);
     expect(first.json<ClaimResponse>().token).toBeUndefined();
@@ -320,7 +432,13 @@ describe("Raise closed loop", () => {
     const tokenReplay = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
+      payload: {
+        raiseId: created.raiseId,
+        token,
+        mode: "token",
+        expectedRole: "agent",
+        exchangeId,
+      },
     });
     expect(tokenReplay.statusCode).toBe(401);
     expect(tokenReplay.json()).toMatchObject({ code: "invalid_capability" });
@@ -328,168 +446,20 @@ describe("Raise closed loop", () => {
     const cookieReplay = await app.inject({
       method: "POST",
       url: "/api/claims",
-      payload: { token, mode: "cookie", expectedRole: "agent", exchangeId },
+      payload: {
+        raiseId: created.raiseId,
+        token,
+        mode: "cookie",
+        expectedRole: "agent",
+        exchangeId,
+      },
     });
     expect(cookieReplay.statusCode).toBe(200);
     expect(cookieReplay.json()).toEqual(first.json());
     expect(cookieReplay.headers["set-cookie"]).toBe(first.headers["set-cookie"]);
   });
 
-  it("invalidates every pre-mode claim replay while preserving its existing session", async () => {
-    const created = await create("human");
-    const token = claimToken(created.targetClaimUrl);
-    const exchangeId = createHash("sha256")
-      .update("raise-claim-exchange-v1\0")
-      .update(token)
-      .digest("base64url");
-    const first = await app.inject({
-      method: "POST",
-      url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
-    });
-    expect(first.statusCode).toBe(200);
-    const originalSession = first.json<ClaimResponse>().token as string;
-    await app.close();
-
-    const legacyDatabase = new Database(databasePath);
-    const exchange = legacyDatabase
-      .prepare("SELECT claim_id, session_capability_id, created_at FROM claim_exchanges")
-      .get() as {
-      claim_id: string;
-      session_capability_id: string;
-      created_at: string;
-    };
-    legacyDatabase.pragma("foreign_keys = OFF");
-    legacyDatabase.exec("DROP TABLE claim_exchanges");
-    legacyDatabase.exec(`
-      CREATE TABLE claim_exchanges (
-        claim_id TEXT PRIMARY KEY REFERENCES capabilities(id) ON DELETE CASCADE,
-        exchange_id TEXT NOT NULL,
-        session_capability_id TEXT NOT NULL UNIQUE REFERENCES capabilities(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL
-      )
-    `);
-    legacyDatabase
-      .prepare(
-        `INSERT INTO claim_exchanges
-         (claim_id, exchange_id, session_capability_id, created_at)
-         VALUES (?, ?, ?, ?)`,
-      )
-      .run(exchange.claim_id, exchangeId, exchange.session_capability_id, exchange.created_at);
-    legacyDatabase.close();
-    const sentinel = Buffer.from(exchangeId);
-    expect((await readFile(databasePath)).includes(sentinel)).toBe(true);
-
-    app = await createApp({
-      databasePath,
-      dataDir,
-      publicBaseUrl: "http://raise.test",
-    });
-    await expectDatabaseArtifactsNotToContain(databasePath, sentinel);
-    if (existsSync(`${databasePath}-wal`)) {
-      expect((await readFile(`${databasePath}-wal`)).byteLength).toBe(0);
-    }
-
-    const migratedDatabase = new Database(databasePath, { readonly: true });
-    const exchangeCount = migratedDatabase
-      .prepare("SELECT COUNT(*) AS count FROM claim_exchanges")
-      .get() as { count: number };
-    const claim = migratedDatabase
-      .prepare("SELECT consumed_at FROM capabilities WHERE id = ?")
-      .get(exchange.claim_id) as { consumed_at: string | null };
-    const session = migratedDatabase
-      .prepare("SELECT id FROM capabilities WHERE id = ? AND kind = 'session'")
-      .get(exchange.session_capability_id) as { id: string } | undefined;
-    const columns = migratedDatabase.pragma("table_info(claim_exchanges)") as Array<{
-      name: string;
-    }>;
-    migratedDatabase.close();
-    expect(exchangeCount.count).toBe(0);
-    expect(claim.consumed_at).not.toBeNull();
-    expect(session?.id).toBe(exchange.session_capability_id);
-    expect(columns.map((column) => column.name)).toEqual(
-      expect.arrayContaining(["exchange_id_hash", "exchange_mode"]),
-    );
-
-    await app.close();
-    await expectDatabaseArtifactsNotToContain(databasePath, sentinel);
-    app = await createApp({
-      databasePath,
-      dataDir,
-      publicBaseUrl: "http://raise.test",
-    });
-
-    const existingSession = await app.inject({
-      method: "GET",
-      url: `/api/raises/${created.raiseId}`,
-      headers: auth(originalSession),
-    });
-    expect(existingSession.statusCode).toBe(200);
-
-    const tokenReplay = await app.inject({
-      method: "POST",
-      url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
-    });
-    expect(tokenReplay.statusCode).toBe(401);
-    expect(tokenReplay.json()).toMatchObject({ code: "invalid_capability" });
-
-    const cookieReplay = await app.inject({
-      method: "POST",
-      url: "/api/claims",
-      payload: { token, mode: "cookie", expectedRole: "agent", exchangeId },
-    });
-    expect(cookieReplay.statusCode).toBe(401);
-    expect(cookieReplay.json()).toMatchObject({ code: "invalid_capability" });
-  });
-
-  it("rolls back the whole first exchange if replay persistence fails", async () => {
-    const created = await create("human");
-    const token = claimToken(created.targetClaimUrl);
-    const claimId = token.slice(0, token.indexOf(".")).slice("cap_".length);
-    const exchangeId = replaySecret();
-    const inspection = new Database(databasePath);
-    inspection.exec(`
-      CREATE TRIGGER reject_claim_exchange
-      BEFORE INSERT ON claim_exchanges
-      BEGIN
-        SELECT RAISE(ABORT, 'injected exchange failure');
-      END
-    `);
-    inspection.close();
-
-    const failed = await app.inject({
-      method: "POST",
-      url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
-    });
-    expect(failed.statusCode).toBe(500);
-
-    const afterFailure = new Database(databasePath);
-    const claim = afterFailure
-      .prepare("SELECT consumed_at FROM capabilities WHERE id = ?")
-      .get(claimId) as { consumed_at: string | null };
-    const sessionCount = afterFailure
-      .prepare("SELECT COUNT(*) AS count FROM capabilities WHERE kind = 'session'")
-      .get() as { count: number };
-    const exchangeCount = afterFailure
-      .prepare("SELECT COUNT(*) AS count FROM claim_exchanges")
-      .get() as { count: number };
-    expect(claim.consumed_at).toBeNull();
-    expect(sessionCount.count).toBe(0);
-    expect(exchangeCount.count).toBe(0);
-    afterFailure.exec("DROP TRIGGER reject_claim_exchange");
-    afterFailure.close();
-
-    const retry = await app.inject({
-      method: "POST",
-      url: "/api/claims",
-      payload: { token, mode: "token", expectedRole: "agent", exchangeId },
-    });
-    expect(retry.statusCode).toBe(200);
-  });
-
-  it("stores sanitized image bytes and serves them only with Raise access", async () => {
+  it("stores encrypted image bytes and serves a sanitized image only with Raise access", async () => {
     const created = await create("human", true);
     const humanToken = await exchange(created.ownerClaimUrl);
     const viewResponse = await app.inject({
@@ -507,10 +477,113 @@ describe("Raise closed loop", () => {
     });
     expect(image.statusCode).toBe(200);
     expect(image.headers["content-type"]).toContain("image/webp");
+    expect(image.headers["cache-control"]).toBe("private, no-store");
+    expect(image.headers["content-security-policy"]).not.toContain("localhost");
     expect(image.rawPayload.subarray(0, 4).toString("ascii")).toBe("RIFF");
 
-    const storedFiles = await readFile(join(dataDir, "blobs", `${attachment?.id}.webp`));
-    expect(storedFiles.subarray(0, 4).toString("ascii")).toBe("RIFF");
+    const keys = valkeyRaiseKeys(created.raiseId, testStore.keyPrefix);
+    const rawAttachment = await testStore.client.hGet(keys.meta, `attachment:${attachment?.id}`);
+    const stored = JSON.parse(rawAttachment ?? "null") as { blobKey: string };
+    const storedFiles = await readFile(join(dataDir, "blobs", stored.blobKey));
+    expect(storedFiles.subarray(0, 4).toString("ascii")).not.toBe("RIFF");
+    expect(storedFiles.toString("utf8")).toMatch(/^v1\./);
+  });
+
+  it("rejects undocumented preview values and invalid change queries", async () => {
+    const created = await create("human", true);
+    const humanToken = await exchange(created.ownerClaimUrl);
+    const view = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}`,
+      headers: auth(humanToken),
+    });
+    const attachment = view.json<RaiseView>().entries[0]?.attachments[0];
+    expect(attachment).toBeTruthy();
+
+    const preview = await app.inject({
+      method: "GET",
+      url: `${attachment?.url}?preview=thumbnail`,
+      headers: auth(humanToken),
+    });
+    expect(preview.statusCode).toBe(400);
+
+    const missingCursor = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}/changes`,
+      headers: auth(humanToken),
+    });
+    expect(missingCursor.statusCode).toBe(400);
+
+    const malformedCursor = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}/changes?cursor=1.5`,
+      headers: auth(humanToken),
+    });
+    expect(malformedCursor.statusCode).toBe(400);
+
+    const excessiveWait = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}/changes?cursor=${view.json<RaiseView>().cursor}&wait=31`,
+      headers: auth(humanToken),
+    });
+    expect(excessiveWait.statusCode).toBe(400);
+  });
+
+  it("keeps user text, URLs, filenames, and WebP bytes out of raw persistence", async () => {
+    const sentinel = "RAISE-PLAINTEXT-SENTINEL-3a1e259f";
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/raises",
+      payload: {
+        origin: "human",
+        prompt: sentinel,
+        url: `https://example.test/${sentinel}`,
+        attachments: [{ name: `${sentinel}.png`, mimeType: "image/png", dataUrl: onePixelPng }],
+      },
+    });
+    expect(response.statusCode).toBe(201);
+    const created = response.json<CreateRaiseResponse>();
+    const humanToken = await exchange(created.ownerClaimUrl);
+    const view = await app.inject({
+      method: "GET",
+      url: `/api/raises/${created.raiseId}`,
+      headers: auth(humanToken),
+    });
+    expect(view.json<RaiseView>()).toMatchObject({
+      title: sentinel,
+      entries: [
+        {
+          body: sentinel,
+          url: `https://example.test/${sentinel}`,
+          attachments: [{ name: `${sentinel}.png` }],
+        },
+      ],
+    });
+
+    const attachment = view.json<RaiseView>().entries[0]?.attachments[0];
+    const keys = valkeyRaiseKeys(created.raiseId, testStore.keyPrefix);
+    const rawTitle = await testStore.client.hGet(keys.meta, "titleEnvelope");
+    const rawEntries = await testStore.client.xRange(keys.entries, "-", "+");
+    const rawAttachment = await testStore.client.hGet(keys.meta, `attachment:${attachment?.id}`);
+    const storedAttachment = JSON.parse(rawAttachment ?? "null") as {
+      blobKey: string;
+      displayNameEnvelope: string;
+    };
+    const firstEntry = rawEntries[0]?.message;
+    const envelopes = [
+      rawTitle,
+      firstEntry?.bodyEnvelope,
+      firstEntry?.urlEnvelope,
+      storedAttachment.displayNameEnvelope,
+    ];
+    for (const envelope of envelopes) {
+      expect(envelope).toMatch(/^v1\./);
+      expect(envelope).not.toContain(sentinel);
+    }
+    expect(JSON.stringify({ rawTitle, rawEntries, rawAttachment })).not.toContain(sentinel);
+    const encryptedImage = await readFile(join(dataDir, "blobs", storedAttachment.blobKey));
+    expect(encryptedImage.includes(Buffer.from("RIFF", "ascii"))).toBe(false);
+    expect(encryptedImage.includes(Buffer.from("WEBP", "ascii"))).toBe(false);
   });
 
   it("creates a screenshot-only request with a useful title", async () => {
@@ -521,7 +594,6 @@ describe("Raise closed loop", () => {
         origin: "human",
         prompt: "",
         attachments: [{ name: "billing.png", mimeType: "image/png", dataUrl: onePixelPng }],
-        expiresInHours: 24,
       },
     });
     expect(response.statusCode).toBe(201);
@@ -582,8 +654,7 @@ describe("Raise closed loop", () => {
 
   it("returns 413 when the JSON body exceeds the transport limit", async () => {
     await app.close();
-    app = await createApp({
-      databasePath,
+    app = await createValkeyTestApp(testStore.store, {
       dataDir,
       publicBaseUrl: "http://raise.test",
       bodyLimit: 256,
@@ -630,12 +701,7 @@ describe("Raise closed loop", () => {
     });
     expect(rejectedCreate.statusCode).toBe(400);
 
-    const inspection = new Database(databasePath, { readonly: true });
-    const count = inspection.prepare("SELECT COUNT(*) AS count FROM raises").get() as {
-      count: number;
-    };
-    inspection.close();
-    expect(count.count).toBe(0);
+    expect(await testStore.client.keys(`${testStore.keyPrefix}*`)).toEqual([]);
 
     const created = await create("human");
     const agentToken = await exchange(created.targetClaimUrl);

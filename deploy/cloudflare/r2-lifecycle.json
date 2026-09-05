@@ -1,0 +1,17 @@
+{
+  "rules": [
+    {
+      "id": "raise-ephemeral-v1",
+      "enabled": true,
+      "conditions": {
+        "prefix": "ephemeral/v1/"
+      },
+      "deleteObjectsTransition": {
+        "condition": {
+          "type": "Age",
+          "maxAge": 21600
+        }
+      }
+    }
+  ]
+}

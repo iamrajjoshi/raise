@@ -968,16 +968,6 @@ a {
   background: var(--green);
 }
 
-.status-label[data-status="expired"],
-.status-label[data-status="cancelled"] {
-  color: var(--red);
-}
-
-.status-label[data-status="expired"]::before,
-.status-label[data-status="cancelled"]::before {
-  background: var(--red);
-}
-
 .record-heading h1 {
   max-width: 22ch;
   margin: 0;

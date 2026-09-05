@@ -36,7 +36,7 @@ export function ShareCard({ url, target }: { url: string; target: "agent" | "hum
         <strong>{target === "agent" ? "Agent link" : "Human link"}</strong>
         <p>
           {target === "agent"
-            ? "Connected agents will see this in their inbox. Otherwise, send this one-time link."
+            ? "Send this one-time link to the agent. Raise won’t show it again."
             : "Send this one-time link before you close the tab. Raise won’t show it again."}
         </p>
         <code>{url}</code>

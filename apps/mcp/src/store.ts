@@ -2,10 +2,47 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, normalize } from "node:path";
 import { chmod, link, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
-import type { CreateRaiseResponse } from "@raise/protocol";
-import type { StoredSession } from "./client.js";
+import {
+  createRaiseResponseSchema,
+  idempotencyKeySchema,
+  raiseIdSchema,
+  type CreateRaiseInput,
+  type CreateRaiseResponse,
+  type PostEntryInput,
+} from "@raise/protocol";
+import * as z from "zod/v4";
+import { storedSessionSchema, type StoredSession } from "./session.js";
 
 const pendingRecordTtlMs = 7 * 24 * 60 * 60 * 1_000;
+const pendingMutationTtlMs = 7 * 60 * 60 * 1_000;
+
+interface PendingRecordStoreOptions {
+  now?: () => Date;
+  ttlMs?: number;
+}
+
+const sha256DigestSchema = z.string().regex(/^[0-9a-f]{64}$/);
+const pendingExchangeRecordSchema = z.object({
+  server: z.url(),
+  claimTokenHash: sha256DigestSchema,
+  exchangeId: z.uuid(),
+  createdAt: z.iso.datetime(),
+});
+const pendingMutationRecordSchema = z.object({
+  server: z.url(),
+  raiseId: raiseIdSchema,
+  sessionDigest: sha256DigestSchema,
+  inputDigest: sha256DigestSchema,
+  idempotencyKey: idempotencyKeySchema,
+  expectedVersion: z.number().int().positive(),
+  createdAt: z.iso.datetime(),
+});
+type PendingMutationRecord = z.infer<typeof pendingMutationRecordSchema>;
+const pendingOpenRecordSchema = z.object({
+  inputDigest: sha256DigestSchema,
+  createdAt: z.iso.datetime(),
+  created: createRaiseResponseSchema,
+});
 
 function key(server: string, raiseId: string) {
   return `${new URL(server).origin}|${raiseId}`;
@@ -20,6 +57,25 @@ function claimTokenHash(claimToken: string) {
 
 function isMissingFile(error: unknown) {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+async function unlinkIfPresent(path: string) {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+  }
+}
+
+async function readPrivateJson(path: string, errorMessage: string): Promise<unknown | undefined> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    await chmod(path, 0o600);
+    return parsed;
+  } catch (error) {
+    if (isMissingFile(error)) return undefined;
+    throw new Error(errorMessage, { cause: error });
+  }
 }
 
 async function ensurePrivateDirectory(directory: string) {
@@ -43,7 +99,7 @@ async function createPrivateFile(path: string, value: unknown) {
     }
     throw error;
   } finally {
-    await unlink(temporary).catch(() => undefined);
+    await unlinkIfPresent(temporary);
   }
 }
 
@@ -94,15 +150,13 @@ async function removeExpiredRecords(
         }
         const timestamp = Date.parse(parsed.createdAt);
         if (Number.isFinite(timestamp) && timestamp + ttlMs <= now().getTime()) {
-          await unlink(path).catch((error: unknown) => {
-            if (!isMissingFile(error)) throw error;
-          });
+          await unlinkIfPresent(path);
         }
       }),
   );
 }
 
-export function defaultStateDirectory() {
+function defaultStateDirectory() {
   if (process.env.RAISE_STATE_DIR) return process.env.RAISE_STATE_DIR;
   if (process.env.XDG_STATE_HOME) return join(process.env.XDG_STATE_HOME, "raise", "sessions");
   return join(homedir(), ".raise", "sessions");
@@ -133,17 +187,21 @@ export class SessionStore {
     const sessionKey = key(server, raiseId);
     let session = this.memory.get(sessionKey);
     if (!session) {
-      try {
-        session = JSON.parse(
-          await readFile(this.pathFor(server, raiseId), "utf8"),
-        ) as StoredSession;
-      } catch (error) {
-        if (!isMissingFile(error)) throw error;
+      const stored = await readPrivateJson(
+        this.pathFor(server, raiseId),
+        `Could not read the local session for ${raiseId}.`,
+      );
+      if (stored !== undefined) {
+        const parsed = storedSessionSchema.safeParse(stored);
+        if (!parsed.success) {
+          throw new Error(`The local session for ${raiseId} is invalid.`);
+        }
+        session = parsed.data;
       }
     }
     if (!session) {
       throw new Error(
-        `No local session for ${raiseId}. Open it with raise_open, raise_claim, or raise_inbox first.`,
+        `No local session for ${raiseId}. Open it with raise_open or raise_claim first.`,
       );
     }
     if (session.server !== new URL(server).origin || session.raiseId !== raiseId) {
@@ -151,7 +209,7 @@ export class SessionStore {
     }
     if (session.expiresAt <= new Date().toISOString()) {
       this.memory.delete(sessionKey);
-      await unlink(this.pathFor(server, raiseId)).catch(() => undefined);
+      await unlinkIfPresent(this.pathFor(server, raiseId));
       throw new Error(`The local session for ${raiseId} has expired.`);
     }
     this.memory.set(sessionKey, session);
@@ -160,10 +218,11 @@ export class SessionStore {
 
   async put(session: StoredSession) {
     this.memory.set(key(session.server, session.raiseId), session);
+    let temporary: string | undefined;
     try {
       await ensurePrivateDirectory(this.directory);
       const path = this.pathFor(session.server, session.raiseId);
-      const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+      temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
       await writeFile(temporary, `${JSON.stringify(session, null, 2)}\n`, {
         mode: 0o600,
         flag: "wx",
@@ -173,6 +232,8 @@ export class SessionStore {
       return true;
     } catch {
       return false;
+    } finally {
+      if (temporary) await unlinkIfPresent(temporary);
     }
   }
 }
@@ -183,7 +244,7 @@ export class PendingExchangeStore {
 
   constructor(
     readonly directory = defaultStateDirectory(),
-    options: { now?: () => Date; ttlMs?: number } = {},
+    options: PendingRecordStoreOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
     this.ttlMs = options.ttlMs ?? pendingRecordTtlMs;
@@ -205,36 +266,16 @@ export class PendingExchangeStore {
   }
 
   private async read(path: string) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(path, "utf8"));
-      await chmod(path, 0o600);
-    } catch (error) {
-      if (isMissingFile(error)) return undefined;
-      throw new Error("Could not read the local pending claim exchange state.", {
-        cause: error,
-      });
-    }
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      !("server" in parsed) ||
-      typeof parsed.server !== "string" ||
-      !("claimTokenHash" in parsed) ||
-      typeof parsed.claimTokenHash !== "string" ||
-      !("exchangeId" in parsed) ||
-      typeof parsed.exchangeId !== "string" ||
-      !("createdAt" in parsed) ||
-      typeof parsed.createdAt !== "string"
-    ) {
+    const parsed = await readPrivateJson(
+      path,
+      "Could not read the local pending claim exchange state.",
+    );
+    if (parsed === undefined) return undefined;
+    const record = pendingExchangeRecordSchema.safeParse(parsed);
+    if (!record.success) {
       throw new Error("The local pending claim exchange state is invalid.");
     }
-    return parsed as {
-      server: string;
-      claimTokenHash: string;
-      exchangeId: string;
-      createdAt: string;
-    };
+    return record.data;
   }
 
   async getOrCreate(server: string, claimToken: string) {
@@ -250,9 +291,7 @@ export class PendingExchangeStore {
         if (!recordExpired(existing.createdAt, this.now, this.ttlMs)) {
           return existing.exchangeId;
         }
-        await unlink(path).catch((error: unknown) => {
-          if (!isMissingFile(error)) throw error;
-        });
+        await unlinkIfPresent(path);
         continue;
       }
       const exchangeId = randomUUID();
@@ -271,19 +310,13 @@ export class PendingExchangeStore {
 
   async clear(server: string, claimToken: string) {
     const { path } = this.record(server, claimToken);
-    await unlink(path).catch((error: unknown) => {
-      if (!isMissingFile(error)) throw error;
-    });
+    await unlinkIfPresent(path);
   }
 }
 
-export interface PendingOpenInput {
-  prompt: string;
-  title?: string;
-  url?: string;
+export type PendingOpenInput = Pick<CreateRaiseInput, "prompt" | "title" | "url"> & {
   screenshotPaths: string[];
-  expiresInHours: number;
-}
+};
 
 export function pendingOpenDigest(input: PendingOpenInput) {
   return createHash("sha256")
@@ -294,10 +327,148 @@ export function pendingOpenDigest(input: PendingOpenInput) {
         input.title?.trim() ?? null,
         input.url ? new URL(input.url).href : null,
         input.screenshotPaths.map((path) => normalize(path)),
-        input.expiresInHours,
       ]),
     )
     .digest("hex");
+}
+
+export function pendingMutationDigest(input: PostEntryInput) {
+  const attachments = input.attachments.map((attachment) => [
+    attachment.name.trim(),
+    attachment.mimeType,
+    createHash("sha256").update(attachment.dataUrl).digest("hex"),
+  ]);
+  return createHash("sha256")
+    .update("raise-mcp-pending-mutation-v1\0")
+    .update(
+      JSON.stringify([
+        input.kind,
+        input.body.trim(),
+        input.url ? new URL(input.url).href : null,
+        input.decision ?? null,
+        attachments,
+      ]),
+    )
+    .digest("hex");
+}
+
+export interface PendingMutation {
+  idempotencyKey: string;
+  expectedVersion: number;
+  resumed: boolean;
+}
+
+export class PendingMutationStore {
+  private readonly now: () => Date;
+  private readonly ttlMs: number;
+
+  constructor(
+    readonly directory = defaultStateDirectory(),
+    options: PendingRecordStoreOptions = {},
+  ) {
+    this.now = options.now ?? (() => new Date());
+    this.ttlMs = options.ttlMs ?? pendingMutationTtlMs;
+  }
+
+  private identity(session: StoredSession, inputDigest: string, expectedVersion: number) {
+    if (!/^[0-9a-f]{64}$/.test(inputDigest)) {
+      throw new Error("The pending mutation input digest is invalid.");
+    }
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 1) {
+      throw new Error("The pending mutation version is invalid.");
+    }
+    const server = new URL(session.server).origin;
+    const sessionDigest = createHash("sha256")
+      .update("raise-mcp-session-identity-v1\0")
+      .update(server)
+      .update("\0")
+      .update(session.raiseId)
+      .update("\0")
+      .update(session.token)
+      .digest("hex");
+    const recordHash = createHash("sha256")
+      .update(server)
+      .update("\0")
+      .update(session.raiseId)
+      .update("\0")
+      .update(sessionDigest)
+      .update("\0")
+      .update(inputDigest)
+      .update("\0")
+      .update(String(expectedVersion))
+      .digest("hex");
+    return {
+      server,
+      raiseId: session.raiseId,
+      sessionDigest,
+      inputDigest,
+      expectedVersion,
+      path: join(this.directory, `pending-mutation-${recordHash}.json`),
+    };
+  }
+
+  private async read(path: string): Promise<PendingMutationRecord | undefined> {
+    const parsed = await readPrivateJson(path, "Could not read the local pending mutation state.");
+    if (parsed === undefined) return undefined;
+    const record = pendingMutationRecordSchema.safeParse(parsed);
+    if (!record.success) {
+      throw new Error("The local pending mutation state is invalid.");
+    }
+    return record.data;
+  }
+
+  async getOrCreate(
+    session: StoredSession,
+    inputDigest: string,
+    expectedVersion: number,
+  ): Promise<PendingMutation> {
+    await ensurePrivateDirectory(this.directory);
+    await removeExpiredRecords(this.directory, "pending-mutation-", this.now, this.ttlMs);
+    const identity = this.identity(session, inputDigest, expectedVersion);
+    for (;;) {
+      const existing = await this.read(identity.path);
+      if (existing) {
+        if (
+          existing.server !== identity.server ||
+          existing.raiseId !== identity.raiseId ||
+          existing.sessionDigest !== identity.sessionDigest ||
+          existing.inputDigest !== identity.inputDigest ||
+          existing.expectedVersion !== identity.expectedVersion
+        ) {
+          throw new Error("The local pending mutation state does not match this operation.");
+        }
+        if (!recordExpired(existing.createdAt, this.now, this.ttlMs)) {
+          return {
+            idempotencyKey: existing.idempotencyKey,
+            expectedVersion: existing.expectedVersion,
+            resumed: true,
+          };
+        }
+        await unlinkIfPresent(identity.path);
+        continue;
+      }
+
+      const idempotencyKey = randomUUID();
+      if (
+        await createPrivateFile(identity.path, {
+          server: identity.server,
+          raiseId: identity.raiseId,
+          sessionDigest: identity.sessionDigest,
+          inputDigest: identity.inputDigest,
+          idempotencyKey,
+          expectedVersion: identity.expectedVersion,
+          createdAt: this.now().toISOString(),
+        } satisfies PendingMutationRecord)
+      ) {
+        return { idempotencyKey, expectedVersion: identity.expectedVersion, resumed: false };
+      }
+    }
+  }
+
+  async clear(session: StoredSession, inputDigest: string, expectedVersion: number) {
+    const { path } = this.identity(session, inputDigest, expectedVersion);
+    await unlinkIfPresent(path);
+  }
 }
 
 export class PendingOpenStore {
@@ -306,7 +477,7 @@ export class PendingOpenStore {
 
   constructor(
     readonly directory = defaultStateDirectory(),
-    options: { now?: () => Date; ttlMs?: number } = {},
+    options: PendingRecordStoreOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
     this.ttlMs = options.ttlMs ?? pendingRecordTtlMs;
@@ -322,41 +493,17 @@ export class PendingOpenStore {
   async get(inputDigest: string) {
     await removeExpiredRecords(this.directory, "pending-open-", this.now, this.ttlMs);
     const path = this.pathFor(inputDigest);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(await readFile(path, "utf8"));
-      await chmod(path, 0o600);
-    } catch (error) {
-      if (isMissingFile(error)) return undefined;
-      throw new Error("Could not read the local pending open state.", { cause: error });
-    }
-    const created =
-      parsed && typeof parsed === "object" && "created" in parsed ? parsed.created : undefined;
-    if (
-      !parsed ||
-      typeof parsed !== "object" ||
-      !("inputDigest" in parsed) ||
-      parsed.inputDigest !== inputDigest ||
-      !("createdAt" in parsed) ||
-      typeof parsed.createdAt !== "string" ||
-      !created ||
-      typeof created !== "object" ||
-      !("raiseId" in created) ||
-      typeof created.raiseId !== "string" ||
-      !("ownerClaimUrl" in created) ||
-      typeof created.ownerClaimUrl !== "string" ||
-      !("targetClaimUrl" in created) ||
-      typeof created.targetClaimUrl !== "string" ||
-      !("targetRole" in created) ||
-      (created.targetRole !== "human" && created.targetRole !== "agent")
-    ) {
+    const parsed = await readPrivateJson(path, "Could not read the local pending open state.");
+    if (parsed === undefined) return undefined;
+    const record = pendingOpenRecordSchema.safeParse(parsed);
+    if (!record.success || record.data.inputDigest !== inputDigest) {
       throw new Error("The local pending open state is invalid.");
     }
-    if (recordExpired(parsed.createdAt, this.now, this.ttlMs)) {
+    if (recordExpired(record.data.createdAt, this.now, this.ttlMs)) {
       await this.clear(inputDigest);
       return undefined;
     }
-    return created as CreateRaiseResponse;
+    return record.data.created;
   }
 
   async put(inputDigest: string, created: CreateRaiseResponse) {
@@ -378,8 +525,6 @@ export class PendingOpenStore {
   }
 
   async clear(inputDigest: string) {
-    await unlink(this.pathFor(inputDigest)).catch((error: unknown) => {
-      if (!isMissingFile(error)) throw error;
-    });
+    await unlinkIfPresent(this.pathFor(inputDigest));
   }
 }

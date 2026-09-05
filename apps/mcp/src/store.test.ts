@@ -1,10 +1,12 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  pendingMutationDigest,
   pendingOpenDigest,
   PendingExchangeStore,
+  PendingMutationStore,
   PendingOpenStore,
   SessionStore,
 } from "./store.js";
@@ -85,6 +87,54 @@ describe("MCP session store", () => {
     expect(await readFile(blockedPath, "utf8")).toBe("blocked");
   });
 
+  it("rejects malformed persisted sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
+    paths.push(root);
+    const directory = join(root, "sessions");
+    const session = {
+      server: "https://raise.example",
+      raiseId: "r_invalid",
+      role: "agent" as const,
+      token: "ses_invalid.secret",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+    await new SessionStore(directory).put(session);
+    const [sessionFile] = await readdir(directory);
+    if (!sessionFile) throw new Error("Expected a persisted session file.");
+    await writeFile(join(directory, sessionFile), JSON.stringify({ ...session, role: "admin" }));
+
+    await expect(new SessionStore(directory).get(session.server, session.raiseId)).rejects.toThrow(
+      "invalid",
+    );
+  });
+
+  it("removes a token-bearing temporary file when a session replacement fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
+    paths.push(root);
+    const directory = join(root, "sessions");
+    const store = new SessionStore(directory);
+    const session = {
+      server: "https://raise.example",
+      raiseId: "r_cleanup",
+      role: "agent" as const,
+      token: "ses_cleanup.private-secret",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+
+    await expect(store.put(session)).resolves.toBe(true);
+    const [sessionFile] = await readdir(directory);
+    if (!sessionFile) throw new Error("Expected the initial session file.");
+    const sessionPath = join(directory, sessionFile);
+    await rm(sessionPath);
+    await mkdir(sessionPath);
+
+    await expect(store.put({ ...session, token: "ses_cleanup.replacement-secret" })).resolves.toBe(
+      false,
+    );
+    expect(await readdir(directory)).toEqual([sessionFile]);
+    expect(await readdir(sessionPath)).toEqual([]);
+  });
+
   it("persists random claim retry IDs without storing claim secrets", async () => {
     const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
     paths.push(root);
@@ -158,6 +208,152 @@ describe("MCP session store", () => {
     expect(replacement).not.toBe(first);
   });
 
+  it("persists an exact mutation retry without storing content or credentials", async () => {
+    const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
+    paths.push(root);
+    const directory = join(root, "sessions");
+    const session = {
+      server: "https://raise.example",
+      raiseId: "r_mutation",
+      role: "agent" as const,
+      token: "ses_agent.a-private-bearer-token",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+    const privateBody = "The private answer belongs only in the request.";
+    const privateUrl = "https://private.example/design?draft=secret";
+    const privateImage = "data:image/png;base64,cHJpdmF0ZS1pbWFnZS1ieXRlcw==";
+    const inputDigest = pendingMutationDigest({
+      kind: "result",
+      body: privateBody,
+      url: privateUrl,
+      attachments: [
+        {
+          name: "private-design.png",
+          mimeType: "image/png",
+          dataUrl: privateImage,
+        },
+      ],
+      expectedVersion: 3,
+    });
+    const first = new PendingMutationStore(directory);
+
+    const pending = await first.getOrCreate(session, inputDigest, 3);
+    expect(pending).toMatchObject({ expectedVersion: 3, resumed: false });
+    expect(pending.idempotencyKey).toMatch(/^[A-Za-z0-9_-]{16,128}$/);
+
+    await expect(
+      new PendingMutationStore(directory).getOrCreate(session, inputDigest, 3),
+    ).resolves.toEqual({ ...pending, resumed: true });
+
+    const files = (await readdir(directory)).filter((file) => file.startsWith("pending-mutation-"));
+    expect(files).toHaveLength(1);
+    const path = join(directory, files[0]!);
+    const contents = await readFile(path, "utf8");
+    expect(Object.keys(JSON.parse(contents) as object).sort()).toEqual([
+      "createdAt",
+      "expectedVersion",
+      "idempotencyKey",
+      "inputDigest",
+      "raiseId",
+      "server",
+      "sessionDigest",
+    ]);
+    expect(contents).toContain(pending.idempotencyKey);
+    expect(contents).toContain(inputDigest);
+    expect(contents).not.toContain(session.token);
+    expect(contents).not.toContain(privateBody);
+    expect(contents).not.toContain(privateUrl);
+    expect(contents).not.toContain("private-design.png");
+    expect(contents).not.toContain(privateImage);
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+  });
+
+  it("uses new mutation keys for different content, versions, and sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
+    paths.push(root);
+    const directory = join(root, "sessions");
+    const session = {
+      server: "https://raise.example",
+      raiseId: "r_mutation",
+      role: "agent" as const,
+      token: "ses_agent.first-private-token",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+    const firstDigest = pendingMutationDigest({
+      kind: "comment",
+      body: "First note",
+      attachments: [],
+      expectedVersion: 3,
+    });
+    const secondDigest = pendingMutationDigest({
+      kind: "comment",
+      body: "Different note",
+      attachments: [],
+      expectedVersion: 3,
+    });
+    const store = new PendingMutationStore(directory);
+
+    const first = await store.getOrCreate(session, firstDigest, 3);
+    const changedContent = await store.getOrCreate(session, secondDigest, 3);
+    const changedVersion = await store.getOrCreate(session, firstDigest, 4);
+    const changedSession = await store.getOrCreate(
+      { ...session, token: "ses_agent.second-private-token" },
+      firstDigest,
+      3,
+    );
+
+    expect(
+      new Set([
+        first.idempotencyKey,
+        changedContent.idempotencyKey,
+        changedVersion.idempotencyKey,
+        changedSession.idempotencyKey,
+      ]).size,
+    ).toBe(4);
+  });
+
+  it("shares one mutation key concurrently, clears it, and expires stale records", async () => {
+    const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
+    paths.push(root);
+    const directory = join(root, "sessions");
+    let timestamp = Date.parse("2026-09-02T00:00:00.000Z");
+    const session = {
+      server: "https://raise.example",
+      raiseId: "r_mutation",
+      role: "agent" as const,
+      token: "ses_agent.concurrent-private-token",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    };
+    const digest = pendingMutationDigest({
+      kind: "comment",
+      body: "One concurrent operation",
+      attachments: [],
+      expectedVersion: 2,
+    });
+    const stores = Array.from(
+      { length: 12 },
+      () =>
+        new PendingMutationStore(directory, {
+          now: () => new Date(timestamp),
+          ttlMs: 1_000,
+        }),
+    );
+
+    const concurrent = await Promise.all(
+      stores.map((store) => store.getOrCreate(session, digest, 2)),
+    );
+    expect(new Set(concurrent.map((record) => record.idempotencyKey)).size).toBe(1);
+
+    const originalKey = concurrent[0]!.idempotencyKey;
+    await stores[0]!.clear(session, digest, 2);
+    const afterClear = await stores[0]!.getOrCreate(session, digest, 2);
+    expect(afterClear.idempotencyKey).not.toBe(originalKey);
+
+    timestamp += 1_001;
+    const afterExpiry = await stores[0]!.getOrCreate(session, digest, 2);
+    expect(afterExpiry.idempotencyKey).not.toBe(afterClear.idempotencyKey);
+  });
+
   it("persists resumable opens in private files and expires them", async () => {
     const root = await mkdtemp(join(tmpdir(), "raise-mcp-store-"));
     paths.push(root);
@@ -170,7 +366,6 @@ describe("MCP session store", () => {
     const inputDigest = pendingOpenDigest({
       prompt: "Check the header.",
       screenshotPaths: [],
-      expiresInHours: 24,
     });
     const created = {
       raiseId: "r_open",

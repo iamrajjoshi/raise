@@ -8,7 +8,7 @@ import {
   type KeyboardEvent,
   type ReactNode,
 } from "react";
-import type { AttachmentInput } from "@raise/protocol";
+import { supportedAttachmentMimeTypes, type AttachmentInput } from "@raise/protocol";
 import { imageFiles, RequestError } from "../lib/api";
 import {
   appendPlainText,
@@ -102,9 +102,8 @@ export function Scratchpad({
     }
     if (textImport.error) problems.push(textImport.error);
 
-    if (unsupported.length) {
-      problems.push(unsupportedFileMessage(unsupported[0] as File));
-    }
+    const firstUnsupported = unsupported[0];
+    if (firstUnsupported) problems.push(unsupportedFileMessage(firstUnsupported));
     setFileError(problems[0] ?? null);
   };
 
@@ -223,7 +222,7 @@ export function Scratchpad({
             id={inputId}
             ref={input}
             type="file"
-            accept="image/png,image/jpeg,image/webp,text/plain,text/markdown,.txt,.md,.markdown"
+            accept={`${supportedAttachmentMimeTypes.join(",")},text/plain,text/markdown,.txt,.md,.markdown`}
             multiple
             hidden
             onChange={(event) => {

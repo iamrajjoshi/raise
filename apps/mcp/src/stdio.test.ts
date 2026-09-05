@@ -32,7 +32,6 @@ describe("Raise MCP stdio server", () => {
     expect(tools.tools.map((tool) => tool.name)).toEqual([
       "raise_open",
       "raise_claim",
-      "raise_inbox",
       "raise_read",
       "raise_reply",
       "raise_screenshot",

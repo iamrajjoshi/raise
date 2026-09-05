@@ -14,6 +14,8 @@ function raiseView(id: string, title: string): RaiseView {
     waitingOn: "human",
     pendingAction: "review_result",
     version: 2,
+    cursor: "1725552123456-0",
+    entriesMode: "snapshot",
     createdAt: "2026-09-01T08:00:00.000Z",
     updatedAt: "2026-09-01T09:00:00.000Z",
     expiresAt: "2026-09-02T08:00:00.000Z",

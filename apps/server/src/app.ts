@@ -1,29 +1,34 @@
-import { createHash, timingSafeEqual } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import cookie from "@fastify/cookie";
 import fastifyStatic from "@fastify/static";
 import {
   attachmentBudgetMessage,
+  attachmentPreviewSchema,
   claimSchema,
+  changesQuerySchema,
   createRaiseSchema,
-  inboxQuerySchema,
+  idempotencyKeySchema,
   postEntrySchema,
   type ApiError,
 } from "@raise/protocol";
 import Fastify, { type FastifyRequest } from "fastify";
-import { RaiseDatabase } from "./database.js";
+import { ChangeWaiter } from "./change-waiter.js";
 import { HttpError } from "./errors.js";
-import { prepareImages, renderAgentPreview, storeImages } from "./images.js";
+import { renderAgentPreview } from "./images.js";
+import { RaiseService } from "./raise-service.js";
+import type { BlobStore, RaiseStore } from "./storage.js";
 
 export interface AppOptions {
-  databasePath: string;
-  dataDir: string;
   publicBaseUrl: string;
   logger?: boolean;
   bodyLimit?: number;
-  inboxToken?: string;
+}
+
+export interface AppDependencies {
+  raises: RaiseStore;
+  blobs: BlobStore;
+  changes?: ChangeWaiter;
 }
 
 function bearerToken(request: FastifyRequest, raiseId: string): string | undefined {
@@ -32,47 +37,80 @@ function bearerToken(request: FastifyRequest, raiseId: string): string | undefin
   return request.cookies[`raise_session_${raiseId}`];
 }
 
-function authorizationBearer(request: FastifyRequest): string | undefined {
-  const match = /^Bearer ([^\s]+)$/i.exec(request.headers.authorization ?? "");
-  return match?.[1];
+interface ValidationIssue {
+  message: string;
 }
 
-function secretDigest(value: string): Buffer {
-  return createHash("sha256").update(value).digest();
-}
-
-function secretMatches(value: string, expectedDigest: Buffer): boolean {
-  return timingSafeEqual(secretDigest(value), expectedDigest);
-}
-
-function zodIssues(error: unknown): unknown[] | null {
-  if (!(error instanceof Error) || error.name !== "ZodError" || !("issues" in error)) return null;
-  const issues = error.issues;
-  return Array.isArray(issues) ? issues : null;
-}
-
-function hasIssueMessage(issues: unknown[] | null, message: string): boolean {
-  return Boolean(
-    issues?.some(
-      (issue) =>
-        typeof issue === "object" &&
-        issue !== null &&
-        "message" in issue &&
-        issue.message === message,
-    ),
+function isValidationIssue(value: unknown): value is ValidationIssue {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "message" in value &&
+    typeof value.message === "string"
   );
+}
+
+function isValidationIssueArray(value: unknown): value is ValidationIssue[] {
+  return Array.isArray(value) && value.every((issue: unknown) => isValidationIssue(issue));
+}
+
+function zodIssues(error: unknown): ValidationIssue[] | null {
+  if (!(error instanceof Error) || error.name !== "ZodError" || !("issues" in error)) return null;
+  return isValidationIssueArray(error.issues) ? error.issues : null;
+}
+
+function hasIssueMessage(issues: ValidationIssue[] | null, message: string): boolean {
+  return Boolean(issues?.some((issue) => issue.message === message));
 }
 
 function isBodyTooLarge(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "FST_ERR_CTP_BODY_TOO_LARGE";
 }
 
-export async function createApp(options: AppOptions) {
-  if (options.inboxToken !== undefined && options.inboxToken.length < 32) {
-    throw new Error("RAISE_INBOX_TOKEN must be at least 32 characters when set.");
+function errorResponse(error: unknown): { payload: ApiError; statusCode: number } {
+  const validationIssues = zodIssues(error);
+  if (hasIssueMessage(validationIssues, attachmentBudgetMessage)) {
+    return {
+      payload: { code: "images_too_large", message: attachmentBudgetMessage },
+      statusCode: 413,
+    };
   }
-  const inboxTokenDigest = options.inboxToken ? secretDigest(options.inboxToken) : undefined;
-  await mkdir(options.dataDir, { recursive: true });
+  if (isBodyTooLarge(error)) {
+    return {
+      payload: {
+        code: "payload_too_large",
+        message: "That request is too large to send. Trim the text or use smaller screenshots.",
+      },
+      statusCode: 413,
+    };
+  }
+  if (validationIssues) {
+    return {
+      payload: {
+        code: "invalid_request",
+        message: "We couldn’t read that request. Check what you entered and try again.",
+        details: validationIssues,
+      },
+      statusCode: 400,
+    };
+  }
+  if (error instanceof HttpError) {
+    return {
+      payload: {
+        code: error.code,
+        message: error.message,
+        ...(error.details ? { details: error.details } : {}),
+      },
+      statusCode: error.statusCode,
+    };
+  }
+  return {
+    payload: { code: "internal_error", message: "That didn’t work. Try again." },
+    statusCode: 500,
+  };
+}
+
+export async function createApp(options: AppOptions, dependencies: AppDependencies) {
   const app = Fastify({
     logger: options.logger
       ? {
@@ -81,6 +119,9 @@ export async function createApp(options: AppOptions) {
               "req.headers.authorization",
               "request.headers.authorization",
               "headers.authorization",
+              "req.headers.idempotency-key",
+              "request.headers.idempotency-key",
+              "headers.idempotency-key",
               "body.token",
               "body.exchangeId",
               "req.body.token",
@@ -94,56 +135,29 @@ export async function createApp(options: AppOptions) {
       : false,
     bodyLimit: options.bodyLimit ?? 24_000_000,
   });
-  const db = new RaiseDatabase(options.databasePath);
+  const service = new RaiseService(
+    dependencies.raises,
+    dependencies.blobs,
+    () => options.publicBaseUrl,
+  );
+  const changes = dependencies.changes ?? new ChangeWaiter();
   await app.register(cookie);
 
   app.addHook("onRequest", async (_request, reply) => {
     reply
+      .header("Cache-Control", "private, no-store")
       .header("Referrer-Policy", "no-referrer")
       .header("X-Content-Type-Options", "nosniff")
       .header("X-Frame-Options", "DENY")
       .header("X-Robots-Tag", "noindex, nofollow")
       .header(
         "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ws://localhost:5173",
+        "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
       );
   });
 
   app.setErrorHandler((error, _request, reply) => {
-    const validationIssues = zodIssues(error);
-    const imagesTooLarge = hasIssueMessage(validationIssues, attachmentBudgetMessage);
-    const bodyTooLarge = isBodyTooLarge(error);
-    const payload: ApiError = imagesTooLarge
-      ? {
-          code: "images_too_large",
-          message: attachmentBudgetMessage,
-        }
-      : bodyTooLarge
-        ? {
-            code: "payload_too_large",
-            message: "That request is too large to send. Trim the text or use smaller screenshots.",
-          }
-        : validationIssues
-          ? {
-              code: "invalid_request",
-              message: "We couldn’t read that request. Check what you entered and try again.",
-              details: validationIssues,
-            }
-          : error instanceof HttpError
-            ? {
-                code: error.code,
-                message: error.message,
-                ...(error.details ? { details: error.details } : {}),
-              }
-            : { code: "internal_error", message: "That didn’t work. Try again." };
-    const statusCode =
-      imagesTooLarge || bodyTooLarge
-        ? 413
-        : validationIssues
-          ? 400
-          : error instanceof HttpError
-            ? error.statusCode
-            : 500;
+    const { payload, statusCode } = errorResponse(error);
     if (statusCode === 500) app.log.error(error);
     return reply.code(statusCode).send(payload);
   });
@@ -151,49 +165,20 @@ export async function createApp(options: AppOptions) {
   app.get("/healthz", async () => ({ status: "ok" }));
   app.get("/readyz", async () => ({ status: "ready" }));
 
-  function authenticateInbox(request: FastifyRequest) {
-    if (!inboxTokenDigest) {
-      throw new HttpError(
-        503,
-        "inbox_disabled",
-        "The agent inbox is not configured on this server.",
-      );
-    }
-    const token = authorizationBearer(request);
-    if (!token || !secretMatches(token, inboxTokenDigest)) {
-      throw new HttpError(401, "unauthorized", "Agent inbox authentication failed.");
-    }
-  }
-
-  app.get<{ Querystring: Record<string, unknown> }>("/api/inbox", async (request) => {
-    authenticateInbox(request);
-    const query = inboxQuerySchema.parse(request.query);
-    return db.getInbox(query.limit);
-  });
-
-  app.post<{ Params: { raiseId: string } }>("/api/inbox/:raiseId/session", async (request) => {
-    authenticateInbox(request);
-    return db.createInboxSession(request.params.raiseId);
-  });
-
   app.post("/api/raises", async (request, reply) => {
     const input = createRaiseSchema.parse(request.body);
-    const images = await prepareImages(input.attachments);
-    const created = db.createRaise(input, options.publicBaseUrl);
-    await storeImages({
-      db,
-      dataDir: options.dataDir,
-      raiseId: created.raiseId,
-      entryId: created.entryId,
-      images,
-    });
-    const { entryId: _entryId, ...response } = created;
-    return reply.code(201).send(response);
+    return reply.code(201).send(await service.createRaise(input));
   });
 
   app.post("/api/claims", async (request, reply) => {
     const input = claimSchema.parse(request.body);
-    const claimed = db.exchangeClaim(input.token, input.mode, input.expectedRole, input.exchangeId);
+    const claimed = await service.exchangeClaim(
+      input.raiseId,
+      input.token,
+      input.mode,
+      input.expectedRole,
+      input.exchangeId,
+    );
     if (input.mode === "cookie") {
       const secure = options.publicBaseUrl.startsWith("https://");
       reply.setCookie(`raise_session_${claimed.raiseId}`, claimed.sessionToken, {
@@ -217,7 +202,7 @@ export async function createApp(options: AppOptions) {
     const token = bearerToken(request, request.params.raiseId);
     if (!token)
       throw new HttpError(401, "unauthorized", "Open this request from its original access link.");
-    return db.getRaise(request.params.raiseId, token);
+    return service.getRaise(request.params.raiseId, token);
   });
 
   app.post<{ Params: { raiseId: string } }>(
@@ -231,17 +216,10 @@ export async function createApp(options: AppOptions) {
           "Open this request from its original access link.",
         );
       const input = postEntrySchema.parse(request.body);
-      db.assertCanPostEntry(request.params.raiseId, token, input);
-      const images = await prepareImages(input.attachments);
-      const result = db.postEntry(request.params.raiseId, token, input);
-      await storeImages({
-        db,
-        dataDir: options.dataDir,
-        raiseId: request.params.raiseId,
-        entryId: result.entryId,
-        images,
-      });
-      return reply.code(201).send(db.getRaise(request.params.raiseId, token));
+      const idempotencyKey = idempotencyKeySchema.parse(request.headers["idempotency-key"]);
+      const view = await service.postEntry(request.params.raiseId, token, input, idempotencyKey);
+      changes.notify(request.params.raiseId, view.version);
+      return reply.code(201).send(view);
     },
   );
 
@@ -249,32 +227,68 @@ export async function createApp(options: AppOptions) {
     Params: { raiseId: string; attachmentId: string };
     Querystring: { preview?: string };
   }>("/api/raises/:raiseId/attachments/:attachmentId", async (request, reply) => {
+    const preview = attachmentPreviewSchema.parse(request.query.preview);
     const token = bearerToken(request, request.params.raiseId);
     if (!token)
       throw new HttpError(401, "unauthorized", "Open the request before viewing this screenshot.");
-    const storageKey = db.getAttachment(request.params.raiseId, request.params.attachmentId, token);
-    if (request.query.preview === "mcp") {
-      return reply.type("image/webp").send(await renderAgentPreview(storageKey));
+    const attachment = await service.getAttachment(
+      request.params.raiseId,
+      request.params.attachmentId,
+      token,
+    );
+    if (preview === "mcp") {
+      return reply.type(attachment.mediaType).send(await renderAgentPreview(attachment.bytes));
     }
-    return reply.type("image/webp").send(createReadStream(storageKey));
+    return reply.type(attachment.mediaType).send(attachment.bytes);
   });
 
-  app.get<{ Params: { raiseId: string }; Querystring: { after?: string } }>(
-    "/api/raises/:raiseId/changes",
-    async (request, reply) => {
-      const token = bearerToken(request, request.params.raiseId);
-      if (!token)
-        throw new HttpError(
-          401,
-          "unauthorized",
-          "Open this request from its original access link.",
-        );
-      const view = db.getRaise(request.params.raiseId, token);
-      const after = Number(request.query.after ?? 0);
-      if (view.version <= after) return reply.code(204).send();
-      return view;
-    },
-  );
+  app.get<{
+    Params: { raiseId: string };
+    Querystring: { cursor?: string; wait?: string };
+  }>("/api/raises/:raiseId/changes", async (request, reply) => {
+    const token = bearerToken(request, request.params.raiseId);
+    if (!token)
+      throw new HttpError(401, "unauthorized", "Open this request from its original access link.");
+    const query = changesQuerySchema.parse(request.query);
+    const readChanges = () => service.getRaise(request.params.raiseId, token, query.cursor);
+    const hasEntries = (view: Awaited<ReturnType<typeof readChanges>>) =>
+      view.entriesMode === "snapshot" || view.entries.length > 0;
+
+    const initial = await readChanges();
+    if (hasEntries(initial)) return initial;
+    if (query.wait === 0) return reply.code(204).send();
+
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    request.raw.once("aborted", abort);
+    reply.raw.once("close", abort);
+    try {
+      const waiting = changes.wait(
+        request.params.raiseId,
+        initial.version,
+        query.wait * 1_000,
+        controller.signal,
+      );
+
+      // Register before this read so a write cannot slip between the read and wait.
+      const rechecked = await readChanges();
+      if (hasEntries(rechecked)) {
+        changes.notify(request.params.raiseId, rechecked.version);
+        return rechecked;
+      }
+
+      const outcome = await waiting;
+      if (outcome.reason === "aborted") return reply.code(204).send();
+
+      // A wake is only a hint. Reauthenticate and read authoritative state even on timeout.
+      const final = await readChanges();
+      return hasEntries(final) ? final : reply.code(204).send();
+    } finally {
+      request.raw.off("aborted", abort);
+      reply.raw.off("close", abort);
+      controller.abort();
+    }
+  });
 
   const webRoot = fileURLToPath(new URL("../../web/dist", import.meta.url));
   if (existsSync(webRoot)) {
@@ -287,6 +301,7 @@ export async function createApp(options: AppOptions) {
     });
   }
 
-  app.addHook("onClose", async () => db.close());
+  app.addHook("preClose", async () => changes.close());
+  app.addHook("onClose", async () => service.close());
   return app;
 }

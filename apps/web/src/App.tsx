@@ -11,10 +11,12 @@ import {
   claimTokenFromHash,
   createRaise,
   getRaise,
+  getRaiseChanges,
   postEntry,
   RequestError,
 } from "./lib/api";
 import { groupInboxRaises, loadRememberedRaises, rememberRaise } from "./lib/localInbox";
+import { isTerminalReadError, mergeRaiseView, retryDelayMs, waitForRetry } from "./lib/raiseSync";
 
 function formatDateTime(value: string) {
   return new Intl.DateTimeFormat(undefined, {
@@ -24,6 +26,13 @@ function formatDateTime(value: string) {
     minute: "2-digit",
     timeZoneName: "short",
   }).format(new Date(value));
+}
+
+function statusText(raise: RaiseView): string {
+  if (raise.lifecycle === "resolved") return "Closed";
+  if (raise.waitingOn === raise.viewerRole) return "Your turn";
+  if (raise.waitingOn === "agent") return "Agent’s turn";
+  return "Human’s turn";
 }
 
 function SiteHeader({
@@ -101,10 +110,9 @@ function NewRaisePage() {
         origin: "human",
         prompt,
         attachments: images,
-        expiresInHours: 24,
       });
       const ownerToken = new URL(result.ownerClaimUrl).hash.slice("#token=".length);
-      await claimRaise(ownerToken);
+      await claimRaise(result.raiseId, ownerToken);
       rememberRaise(result.raiseId);
       sessionStorage.setItem(`raise.share.${result.raiseId}`, result.targetClaimUrl);
       window.location.assign(`/r/${result.raiseId}`);
@@ -133,9 +141,7 @@ function NewRaisePage() {
           canSubmit={Boolean(prompt.trim() || images.length)}
           error={error}
           autoFocus
-          note={
-            <>Send the link only to the person you want to answer. It expires after 24 hours.</>
-          }
+          note={<>Send the link only to the person you want to answer. Inactive requests expire.</>}
         />
       </main>
     </AppFrame>
@@ -163,7 +169,7 @@ function RaisePage({ raiseId }: { raiseId: string }) {
         const token = claimTokenFromHash();
         if (token) {
           try {
-            await claimRaise(token);
+            await claimRaise(raiseId, token);
           } catch (caught) {
             if (!(caught instanceof RequestError && caught.code === "invalid_capability")) {
               throw caught;
@@ -188,19 +194,53 @@ function RaisePage({ raiseId }: { raiseId: string }) {
   }, [load, raiseId]);
 
   useEffect(() => {
-    if (!raise || raise.lifecycle !== "open") return;
-    const interval = window.setInterval(() => {
-      void load().catch(() => undefined);
-    }, 3000);
-    return () => window.clearInterval(interval);
-  }, [load, raise]);
+    if (loading || !raise || raise.lifecycle !== "open") return;
+    const controller = new AbortController();
+    let cursor = raise.cursor;
+
+    const watch = async () => {
+      let consecutiveFailures = 0;
+      let open = true;
+      while (!controller.signal.aborted && open) {
+        try {
+          const waitStartedAt = Date.now();
+          const changes = await getRaiseChanges(raiseId, cursor, 20, controller.signal);
+          consecutiveFailures = 0;
+          if (!changes) {
+            const elapsedMs = Date.now() - waitStartedAt;
+            if (elapsedMs < 500) await waitForRetry(500 - elapsedMs, controller.signal);
+            continue;
+          }
+
+          cursor = changes.cursor;
+          open = changes.lifecycle === "open";
+          setRaise((current) => (current ? mergeRaiseView(current, changes) : changes));
+        } catch (caught) {
+          if (controller.signal.aborted) return;
+          if (isTerminalReadError(caught)) {
+            setFatal(
+              caught instanceof RequestError
+                ? caught.message
+                : "This request is no longer available.",
+            );
+            return;
+          }
+          consecutiveFailures += 1;
+          await waitForRetry(retryDelayMs(consecutiveFailures), controller.signal);
+        }
+      }
+    };
+
+    void watch();
+    return () => controller.abort();
+  }, [loading, raiseId]);
 
   const submit = async (entry: PostEntryInput) => {
     setBusy(true);
     setError(null);
     try {
       const updated = await postEntry(raiseId, entry);
-      setRaise(updated);
+      setRaise((current) => (current ? mergeRaiseView(current, updated) : updated));
       return true;
     } catch (caught) {
       setError(caught instanceof RequestError ? caught.message : "That didn’t send. Try again.");
@@ -239,18 +279,6 @@ function RaisePage({ raiseId }: { raiseId: string }) {
   }
 
   const shareUrl = sessionStorage.getItem(`raise.share.${raise.id}`);
-  const statusText =
-    raise.lifecycle === "resolved"
-      ? "Closed"
-      : raise.lifecycle === "expired"
-        ? "Expired"
-        : raise.lifecycle === "cancelled"
-          ? "Cancelled"
-          : raise.waitingOn === raise.viewerRole
-            ? "Your turn"
-            : raise.waitingOn === "agent"
-              ? "Agent’s turn"
-              : "Human’s turn";
   const actionLabel = raise.pendingAction
     ? {
         provide_context: "Add the missing details",
@@ -266,7 +294,7 @@ function RaisePage({ raiseId }: { raiseId: string }) {
         <section className="record-heading">
           <div className="record-heading-topline">
             <span className="status-label" data-status={raise.lifecycle}>
-              {statusText}
+              {statusText(raise)}
             </span>
             <code>{raise.id}</code>
           </div>
@@ -350,7 +378,8 @@ function NotFoundPage() {
 
 export function App() {
   const match = /^\/r\/([^/]+)$/.exec(window.location.pathname);
-  if (match) return <RaisePage raiseId={match[1] as string} />;
+  const raiseId = match?.[1];
+  if (raiseId) return <RaisePage raiseId={raiseId} />;
   if (window.location.pathname === "/inbox") return <InboxPage />;
   if (window.location.pathname === "/" || window.location.pathname === "/new")
     return <NewRaisePage />;

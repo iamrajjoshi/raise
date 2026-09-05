@@ -27,11 +27,7 @@ function formatInboxDate(value: string) {
 }
 
 function actionText(raise: RaiseView) {
-  if (raise.lifecycle !== "open") {
-    if (raise.lifecycle === "resolved") return "Closed";
-    if (raise.lifecycle === "cancelled") return "Cancelled";
-    return "Expired";
-  }
+  if (raise.lifecycle === "resolved") return "Closed";
   if (raise.waitingOn !== raise.viewerRole) {
     return raise.waitingOn === "agent" ? "With the agent" : "Waiting on a reply";
   }
@@ -83,6 +79,41 @@ function InboxSection({
   );
 }
 
+function InboxContents({ groups, loading }: { groups: InboxGroups; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="inbox-loading">
+        <span className="spinner" aria-hidden="true" />
+        <p>Checking your requests…</p>
+      </div>
+    );
+  }
+
+  const total = groups.yourTurn.length + groups.waiting.length + groups.closed.length;
+  if (total > 0) {
+    return (
+      <div className="inbox-sections">
+        <InboxSection title="Your turn" items={groups.yourTurn} state="turn" />
+        <InboxSection title="Waiting" items={groups.waiting} state="wait" />
+        <InboxSection title="Recently closed" items={groups.closed} state="closed" />
+      </div>
+    );
+  }
+
+  return (
+    <section className="inbox-empty">
+      <span aria-hidden="true">00</span>
+      <div>
+        <h2>Nothing waiting.</h2>
+        <p>Start a request or open a shared link and it’ll show up here.</p>
+        <a className="control control-primary" href="/">
+          Start a request
+        </a>
+      </div>
+    </section>
+  );
+}
+
 export function Inbox({
   groups,
   loading,
@@ -92,8 +123,6 @@ export function Inbox({
   loading: boolean;
   failed: number;
 }) {
-  const total = groups.yourTurn.length + groups.waiting.length + groups.closed.length;
-
   return (
     <main className="page inbox-page">
       <header className="inbox-intro">
@@ -110,29 +139,7 @@ export function Inbox({
         </p>
       )}
 
-      {loading ? (
-        <div className="inbox-loading">
-          <span className="spinner" aria-hidden="true" />
-          <p>Checking your requests…</p>
-        </div>
-      ) : total ? (
-        <div className="inbox-sections">
-          <InboxSection title="Your turn" items={groups.yourTurn} state="turn" />
-          <InboxSection title="Waiting" items={groups.waiting} state="wait" />
-          <InboxSection title="Recently closed" items={groups.closed} state="closed" />
-        </div>
-      ) : (
-        <section className="inbox-empty">
-          <span aria-hidden="true">00</span>
-          <div>
-            <h2>Nothing waiting.</h2>
-            <p>Start a request or open a shared link and it’ll show up here.</p>
-            <a className="control control-primary" href="/">
-              Start a request
-            </a>
-          </div>
-        </section>
-      )}
+      <InboxContents groups={groups} loading={loading} />
     </main>
   );
 }

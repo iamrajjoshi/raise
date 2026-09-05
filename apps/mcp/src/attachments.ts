@@ -1,6 +1,7 @@
 import { readFile, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute } from "node:path";
 import {
+  attachmentBudgetMessage,
   maxAttachmentBytesPerEntry,
   maxAttachmentsPerEntry,
   type AttachmentInput,
@@ -27,7 +28,7 @@ export async function attachmentsFromPaths(paths: string[]) {
     if (!info.isFile()) throw new Error(`${path} is not a file.`);
     total += info.size;
     if (total > maxAttachmentBytesPerEntry) {
-      throw new Error("Those screenshots are over the 15 MB limit together.");
+      throw new Error(attachmentBudgetMessage);
     }
     const data = await readFile(path);
     attachments.push({

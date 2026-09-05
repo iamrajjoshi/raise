@@ -1,9 +1,8 @@
-import type { RaiseView } from "@raise/protocol";
+import { raiseIdSchema, type RaiseView } from "@raise/protocol";
 import { RequestError } from "./api";
 
 const inboxStorageKey = "raise.inbox.v1";
 const maxRememberedRaises = 100;
-const raiseIdPattern = /^r_[A-Za-z0-9_-]{6,80}$/;
 
 function browserStorage(storage?: Storage): Storage | null {
   if (storage) return storage;
@@ -18,12 +17,13 @@ export function rememberedRaiseIds(storage?: Storage): string[] {
   const target = browserStorage(storage);
   if (!target) return [];
   try {
-    const parsed = JSON.parse(target.getItem(inboxStorageKey) ?? "[]") as unknown;
+    const parsed: unknown = JSON.parse(target.getItem(inboxStorageKey) ?? "[]");
     if (!Array.isArray(parsed)) return [];
     return Array.from(
       new Set(
         parsed.filter(
-          (value): value is string => typeof value === "string" && raiseIdPattern.test(value),
+          (value): value is string =>
+            typeof value === "string" && raiseIdSchema.safeParse(value).success,
         ),
       ),
     ).slice(0, maxRememberedRaises);
@@ -43,14 +43,14 @@ function writeRaiseIds(ids: string[], storage?: Storage) {
 }
 
 export function rememberRaise(raiseId: string, storage?: Storage) {
-  if (!raiseIdPattern.test(raiseId)) return;
+  if (!raiseIdSchema.safeParse(raiseId).success) return;
   writeRaiseIds(
     [raiseId, ...rememberedRaiseIds(storage).filter((stored) => stored !== raiseId)],
     storage,
   );
 }
 
-export function forgetRaise(raiseId: string, storage?: Storage) {
+function forgetRaise(raiseId: string, storage?: Storage) {
   writeRaiseIds(
     rememberedRaiseIds(storage).filter((stored) => stored !== raiseId),
     storage,
