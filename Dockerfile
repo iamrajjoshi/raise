@@ -9,7 +9,8 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json tsconfig.base
 COPY apps ./apps
 COPY packages ./packages
 RUN pnpm install --frozen-lockfile
-RUN pnpm build
+RUN pnpm --filter @raise/protocol build && pnpm --filter @raise/web build && pnpm --filter @raise/server build
+RUN CI=true pnpm --config.inject-workspace-packages=true --filter @raise/server deploy --prod /prod/server
 
 FROM node:24-bookworm-slim AS runtime
 
@@ -19,12 +20,8 @@ ENV PUBLIC_BASE_URL=http://localhost:8787
 ENV DATA_DIR=/data
 
 WORKDIR /app
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/apps/server/package.json ./apps/server/package.json
-COPY --from=build /app/apps/server/dist ./apps/server/dist
+COPY --from=build /prod/server ./apps/server
 COPY --from=build /app/apps/web/dist ./apps/web/dist
-COPY --from=build /app/packages/protocol/package.json ./packages/protocol/package.json
-COPY --from=build /app/packages/protocol/dist ./packages/protocol/dist
 
 RUN mkdir -p /data/blobs && chown -R node:node /data /app
 USER node

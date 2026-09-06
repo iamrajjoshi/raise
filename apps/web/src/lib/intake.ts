@@ -2,15 +2,17 @@ import {
   attachmentBudgetMessage,
   dataUrlByteLength,
   maxAttachmentBytesPerEntry,
+  maxContentCharacters,
+  supportedAttachmentMimeTypes,
   type AttachmentInput,
 } from "@raise/protocol";
 
-export const maxBodyLength = 20_000;
+export const maxBodyLength = maxContentCharacters;
 export const screenshotBudgetMessage = attachmentBudgetMessage;
 
 const maxTextFilesPerImport = 4;
 const maxTextImportBytes = 16 * 1_024;
-const imageTypes = new Set(["image/png", "image/jpeg", "image/webp"]);
+const imageTypes = new Set<string>(supportedAttachmentMimeTypes);
 
 export interface ClassifiedFiles {
   screenshots: File[];
@@ -94,7 +96,7 @@ export async function importTextFiles(
   if (files.reduce((total, file) => total + file.size, 0) > maxTextImportBytes) {
     return {
       value: currentValue,
-      error: "Those files are too long. Paste the parts you need.",
+      error: "That’s too much text at once. Paste only the parts you need.",
     };
   }
 
@@ -121,12 +123,15 @@ export async function importTextFiles(
         error: `Couldn’t read ${filename} as plain text. Paste its text instead.`,
       };
     }
-    imports.push(`[Imported from: ${filename}]\n${contents}`);
+    imports.push(`[From ${filename}]\n${contents}`);
   }
 
   const value = appendPlainText(currentValue, imports.join("\n\n"));
   if (value.length > maxBodyLength) {
-    return { value: currentValue, error: "That text is too long. Paste the parts you need." };
+    return {
+      value: currentValue,
+      error: "That’s too much text at once. Paste only the parts you need.",
+    };
   }
   return { value, error: null };
 }

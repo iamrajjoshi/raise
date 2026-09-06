@@ -3,14 +3,48 @@ services:
     build: .
     ports:
       - "8787:8787"
+    depends_on:
+      valkey:
+        condition: service_healthy
     environment:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8787}
       DATA_DIR: /data
-      ANONYMOUS_TTL_HOURS: ${ANONYMOUS_TTL_HOURS:-24}
+      VALKEY_URL: ${VALKEY_URL:-redis://valkey:6379}
+      BLOB_STORE: ${BLOB_STORE:-local}
+      BLOB_S3_BUCKET: ${BLOB_S3_BUCKET:-}
+      BLOB_S3_REGION: ${BLOB_S3_REGION:-auto}
+      BLOB_S3_ENDPOINT: ${BLOB_S3_ENDPOINT:-}
+      BLOB_S3_FORCE_PATH_STYLE: ${BLOB_S3_FORCE_PATH_STYLE:-false}
+      BLOB_S3_ACCESS_KEY_ID: ${BLOB_S3_ACCESS_KEY_ID:-}
+      BLOB_S3_SECRET_ACCESS_KEY: ${BLOB_S3_SECRET_ACCESS_KEY:-}
+      BLOB_S3_SESSION_TOKEN: ${BLOB_S3_SESSION_TOKEN:-}
       MAX_IMAGE_BYTES: ${MAX_IMAGE_BYTES:-15728640}
     volumes:
-      - raise-data:/data
+      - raise-blobs:/data
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8.1-alpine
+    command:
+      - valkey-server
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory-policy
+      - noeviction
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    volumes:
+      - valkey-data:/data
     restart: unless-stopped
 
 volumes:
-  raise-data:
+  raise-blobs:
+  valkey-data:

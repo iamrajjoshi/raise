@@ -1,0 +1,23 @@
+{
+  "name": "@raise/mcp",
+  "version": "0.2.0-alpha.2",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "raise-mcp": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "@raise/protocol": "workspace:*",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  }
+}

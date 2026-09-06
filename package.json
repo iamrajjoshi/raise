@@ -1,6 +1,6 @@
 {
   "name": "raise",
-  "version": "0.1.0-alpha.1",
+  "version": "0.2.0-alpha.2",
   "private": true,
   "type": "module",
   "description": "A self-hosted context and review channel for people and coding agents.",
@@ -11,15 +11,16 @@
   },
   "scripts": {
     "dev": "pnpm --filter @raise/protocol build && pnpm --parallel --filter @raise/server --filter @raise/web dev",
-    "build": "pnpm --filter @raise/protocol build && pnpm --filter @raise/web build && pnpm --filter @raise/server build",
+    "build": "pnpm --filter @raise/protocol build && pnpm --filter @raise/web build && pnpm --filter @raise/server build && pnpm --filter @raise/mcp build",
     "start": "pnpm --filter @raise/server start",
+    "mcp": "pnpm --filter @raise/mcp start",
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint . --max-warnings=0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && RAISE_MCP_ENTRY=apps/mcp/dist/main.js pnpm test",
     "readiness": "agent-readiness . --no-web",
     "readiness:json": "agent-readiness . --ci --no-web --format json",
     "readiness:check": "agent-readiness . --ci --no-web --min-level 2"
@@ -27,7 +28,6 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@kodus/agent-readiness": "0.1.3",
-    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.4.0",
     "@typescript-eslint/eslint-plugin": "^8.69.0",
     "@typescript-eslint/parser": "^8.69.0",

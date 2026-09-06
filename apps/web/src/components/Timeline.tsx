@@ -1,4 +1,5 @@
 import type { EntryView, Role } from "@raise/protocol";
+import { Screenshot } from "./Screenshot";
 
 const entryLabel: Record<EntryView["kind"], string> = {
   prompt: "Request",
@@ -17,6 +18,15 @@ function formatTime(value: string) {
   }).format(new Date(value));
 }
 
+function copyUrl(url: string) {
+  return navigator.clipboard.writeText(url);
+}
+
+function authorLabel(entry: EntryView, viewerRole: Role): string {
+  if (entry.authorRole === viewerRole) return "You";
+  return entry.authorRole === "human" ? "Human" : "Agent";
+}
+
 export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewerRole: Role }) {
   return (
     <ol className="timeline" aria-label="Request activity">
@@ -26,13 +36,7 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
             <header className="entry-header">
               <div>
                 <span className="entry-kind">{entryLabel[entry.kind]}</span>
-                <span className="entry-author">
-                  {entry.authorRole === viewerRole
-                    ? "You"
-                    : entry.authorRole === "human"
-                      ? "Reviewer"
-                      : "Agent"}
-                </span>
+                <span className="entry-author">{authorLabel(entry, viewerRole)}</span>
               </div>
               <time dateTime={entry.createdAt}>{formatTime(entry.createdAt)}</time>
             </header>
@@ -40,14 +44,16 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
             {entry.url && (
               <div className="url-item">
                 <div>
-                  <span>Linked page</span>
+                  <span>Page</span>
                   <code>{entry.url}</code>
                 </div>
                 <button
                   type="button"
                   className="control control-quiet url-copy"
                   aria-label="Copy page URL"
-                  onClick={() => navigator.clipboard.writeText(entry.url as string)}
+                  onClick={() => {
+                    if (entry.url) void copyUrl(entry.url);
+                  }}
                 >
                   <span className="control-glyph" aria-hidden="true">
                     ⧉
@@ -75,16 +81,13 @@ export function Timeline({ entries, viewerRole }: { entries: EntryView[]; viewer
                 </div>
                 <div className="evidence-grid">
                   {entry.attachments.map((attachment) => (
-                    <a
-                      className="evidence-image"
-                      href={attachment.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <Screenshot
+                      src={attachment.url}
+                      name={attachment.name}
+                      width={attachment.width}
+                      height={attachment.height}
                       key={attachment.id}
-                    >
-                      <img src={attachment.url} alt={attachment.name} />
-                      <span>{attachment.name}</span>
-                    </a>
+                    />
                   ))}
                 </div>
               </div>

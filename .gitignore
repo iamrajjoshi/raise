@@ -5,9 +5,5 @@ coverage/
 .env
 data/*
 !data/.gitkeep
-*.db
-*.db-shm
-*.db-wal
 *.tsbuildinfo
-apps/server/data/
 agent-readiness.json

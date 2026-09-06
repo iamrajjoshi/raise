@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Raise HTTP API
-  version: 0.1.0-alpha.1
+  version: 0.2.0-alpha.2
   description: A shared request and review API for people and coding agents.
 servers:
   - url: http://localhost:8787
@@ -34,11 +34,11 @@ paths:
   /readyz:
     get:
       operationId: getReadiness
-      summary: Check server readiness
+      summary: Check server startup status
       tags: [Health]
       responses:
         "200":
-          description: The server is ready to accept requests.
+          description: The server finished startup. This alpha response does not probe Redis or blob storage.
           content:
             application/json:
               schema:
@@ -79,7 +79,7 @@ paths:
     post:
       operationId: exchangeClaim
       summary: Exchange a one-time claim
-      description: Consumes a claim token and creates a request-scoped session. Cookie mode sets an HttpOnly cookie; token mode returns the session token in the response body.
+      description: Consumes a claim token for the supplied request ID and creates a request-scoped session. Repeating the same claim with the same random exchange ID and delivery mode replays that session; a different request ID, exchange ID, or mode remains forbidden. Cookie mode sets an HttpOnly cookie; token mode returns the session token in the response body. Replay mappings created by versions that did not record a delivery mode are invalidated during upgrade; already-issued sessions remain valid.
       tags: [Claims]
       requestBody:
         required: true
@@ -103,6 +103,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -139,6 +141,14 @@ paths:
       summary: Add an entry to a request
       description: Adds a response, result, comment, or review decision. Comments do not advance the pending action; other entry kinds must answer it.
       tags: [Requests]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: A UUID or base64url value retained and reused for retries of this exact update.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]{16,128}$"
       security:
         - BearerSession: []
         - BrowserSessionCookie: []
@@ -181,6 +191,14 @@ paths:
       security:
         - BearerSession: []
         - BrowserSessionCookie: []
+      parameters:
+        - name: preview
+          in: query
+          required: false
+          description: Use `mcp` to request an agent-sized WebP preview capped at 1600 px.
+          schema:
+            type: string
+            enum: [mcp]
       responses:
         "200":
           description: The normalized WebP image.
@@ -201,30 +219,41 @@ paths:
       - $ref: "#/components/parameters/RaiseId"
     get:
       operationId: getRequestChanges
-      summary: Read a request after a version
-      description: Returns the current request when its version is greater than `after`; otherwise returns no content. This endpoint does not wait for a change.
+      summary: Read entries after a cursor
+      description: Reads from the opaque cursor returned by an earlier request view. The server may hold the request for up to `wait` seconds. A 200 response contains either newer entries or a replacement snapshot; 204 means the cursor is still current.
       tags: [Requests]
       security:
         - BearerSession: []
         - BrowserSessionCookie: []
       parameters:
-        - name: after
+        - name: cursor
+          in: query
+          required: true
+          description: Opaque read position from the most recent request view.
+          schema:
+            type: string
+            maxLength: 41
+            pattern: "^(?:0|[1-9][0-9]{0,19})-(?:0|[1-9][0-9]{0,19})$"
+        - name: wait
           in: query
           required: false
-          description: Last request version observed by the caller.
+          description: Maximum number of seconds to hold the request while the cursor is current.
           schema:
             type: integer
             minimum: 0
+            maximum: 30
             default: 0
       responses:
         "200":
-          description: The request has a newer version.
+          description: Newer entries or a replacement snapshot are available.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RequestView"
         "204":
-          description: The request does not have a newer version.
+          description: No entries appeared before the wait ended.
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -263,7 +292,7 @@ components:
 
   responses:
     BadRequest:
-      description: The JSON body, entry content, or image is invalid.
+      description: The JSON body, query, entry content, or image is invalid.
       content:
         application/json:
           schema:
@@ -275,7 +304,7 @@ components:
           schema:
             $ref: "#/components/schemas/ApiError"
     Forbidden:
-      description: The other participant must act first.
+      description: The claim role does not match its guard, or the other participant must act first.
       content:
         application/json:
           schema:
@@ -312,7 +341,7 @@ components:
 
     Lifecycle:
       type: string
-      enum: [open, resolved, cancelled, expired]
+      enum: [open, resolved]
 
     PendingAction:
       type: string
@@ -368,6 +397,7 @@ components:
         url:
           type: string
           format: uri
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
           maxLength: 2048
         attachments:
           type: array
@@ -376,11 +406,6 @@ components:
           default: []
           items:
             $ref: "#/components/schemas/AttachmentInput"
-        expiresInHours:
-          type: integer
-          minimum: 1
-          maximum: 168
-          default: 24
 
     CreateRequestResponse:
       type: object
@@ -401,8 +426,12 @@ components:
 
     ClaimInput:
       type: object
-      required: [token]
+      required: [raiseId, token]
       properties:
+        raiseId:
+          type: string
+          pattern: "^r_[A-Za-z0-9_-]{1,97}$"
+          description: Request ID taken from the path of the same claim URL.
         token:
           type: string
           minLength: 20
@@ -412,10 +441,20 @@ components:
           type: string
           enum: [cookie, token]
           default: cookie
+        expectedRole:
+          allOf:
+            - $ref: "#/components/schemas/Role"
+          description: Optional guard checked before the one-time claim is consumed.
+        exchangeId:
+          type: string
+          minLength: 16
+          maxLength: 100
+          pattern: "^[A-Za-z0-9_-]+$"
+          description: Optional client-held retry secret. Generate it independently with a cryptographically secure random source, persist it before the first request, never derive it from the claim URL, and reuse it only with the same claim and delivery mode. The server stores only its SHA-256 digest.
 
     ClaimResponse:
       type: object
-      required: [raiseId, role]
+      required: [raiseId, role, expiresAt]
       properties:
         raiseId:
           type: string
@@ -423,7 +462,11 @@ components:
           $ref: "#/components/schemas/Role"
         token:
           type: string
-          description: "Session bearer token; returned only when the claim uses `mode: token`."
+          description: "Session bearer token; returned for `mode: token` claims."
+        expiresAt:
+          type: string
+          format: date-time
+          description: Latest time the client should retain the scoped session credential. Request access can end earlier after inactivity or acceptance.
 
     PostEntryInput:
       type: object
@@ -439,6 +482,7 @@ components:
         url:
           type: string
           format: uri
+          pattern: "^[Hh][Tt][Tt][Pp][Ss]?://"
           maxLength: 2048
         decision:
           $ref: "#/components/schemas/Decision"
@@ -556,6 +600,8 @@ components:
         - waitingOn
         - pendingAction
         - version
+        - cursor
+        - entriesMode
         - createdAt
         - updatedAt
         - expiresAt
@@ -583,6 +629,16 @@ components:
         version:
           type: integer
           minimum: 1
+          description: Mutation-conflict token supplied as `expectedVersion` on a write.
+        cursor:
+          type: string
+          maxLength: 41
+          pattern: "^(?:0|[1-9][0-9]{0,19})-(?:0|[1-9][0-9]{0,19})$"
+          description: Opaque read position to reuse on the next changes request.
+        entriesMode:
+          type: string
+          enum: [snapshot, delta]
+          description: Replace cached entries for `snapshot`; merge and deduplicate by entry ID for `delta`.
         createdAt:
           type: string
           format: date-time
@@ -596,6 +652,7 @@ components:
           $ref: "#/components/schemas/Permissions"
         entries:
           type: array
+          description: A complete retained thread or only newer entries, as selected by `entriesMode`.
           items:
             $ref: "#/components/schemas/EntryView"
 

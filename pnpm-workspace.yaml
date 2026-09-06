@@ -3,7 +3,6 @@ packages:
   - packages/*
 
 allowBuilds:
-  better-sqlite3: true
   esbuild: true
   sharp: true
 
@@ -21,6 +20,5 @@ minimumReleaseAgeExclude:
   - lucide-react@1.38.0
 
 onlyBuiltDependencies:
-  - better-sqlite3
   - esbuild
   - sharp
