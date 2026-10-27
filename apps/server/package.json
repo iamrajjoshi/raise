@@ -20,7 +20,7 @@
     "@fastify/static": "^10.1.3",
     "@raise/protocol": "workspace:*",
     "@redis/client": "^6.2.1",
-    "fastify": "^5.12.1",
+    "fastify": "^5.12.3",
     "sharp": "^0.35.4"
   },
   "devDependencies": {
