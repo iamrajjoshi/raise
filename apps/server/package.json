@@ -24,6 +24,6 @@
     "sharp": "^0.35.4"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.0.0"
+    "@modelcontextprotocol/client": "2.4.0"
   }
 }
